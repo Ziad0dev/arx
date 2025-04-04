@@ -1,0 +1,1 @@
+arxiv spacy numpy torch scikit-learn transformers sentence-transformers chromadb celery redis RestrictedPython z3-solver tenacity python-dotenv
