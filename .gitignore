@@ -1,0 +1,4 @@
+.venv/
+papers/
+nltk_data/
+__pycache__/

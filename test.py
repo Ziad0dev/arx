@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import arxiv
 import spacy
 import numpy as np
@@ -6,16 +5,44 @@ import torch
 import logging
 import z3
 import redis
+import json
+import time
+import ast
 from typing import List, Dict, Optional, Tuple
 from transformers import AutoTokenizer, GPTNeoForCausalLM
 from sentence_transformers import SentenceTransformer
-from chromadb import Client, Settings
+from chromadb import PersistentClient
 from celery import Celery
 from RestrictedPython import compile_restricted, safe_builtins
 from RestrictedPython.Eval import default_guarded_getiter
 from RestrictedPython.Guards import guarded_unpack_sequence
 from tenacity import retry, stop_after_attempt, wait_exponential
+# Add this at the top of your file after imports
+app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+    broker_connection_retry_on_startup=True,
+)
 
+# Modify your process_paper task to include better tracking:
+@app.task(bind=True, max_retries=3)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def process_paper(self, paper: Dict):
+    """Distributed paper processing task"""
+    try:
+        embedding = self.embedder.encode(paper['summary'])
+        self.vector_db.store_embedding(
+            id=paper['id'],
+            embedding=embedding.tolist(),
+            metadata=paper
+        )
+        self.redis.incr('processed_count')  # Better counting
+        return True
+    except Exception as exc:
+        self.retry(exc=exc)
 # Setup distributed computing
 app = Celery('ai_researcher', broker='redis://localhost:6379/0')
 logging.basicConfig(level=logging.INFO)
@@ -47,19 +74,20 @@ class SecuritySandbox:
             return None, str(e)
 
 class VectorDBManager:
-    """ChromaDB vector database integration"""
+    """ChromaDB vector database integration (updated API)"""
     def __init__(self):
-        self.client = Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=".chromadb"
-        ))
-        self.collection = self.client.get_or_create_collection("research_papers")
+        self.client = PersistentClient(path=".chromadb")
+        self.collection = self.client.get_or_create_collection(
+            name="research_papers",
+            metadata={"hnsw:space": "cosine"}
+        )
 
     def store_embedding(self, id: str, embedding: list, metadata: dict):
         self.collection.add(
             ids=[id],
             embeddings=[embedding],
-            metadatas=[metadata]
+            metadatas=[metadata],
+            documents=[""]
         )
 
     def semantic_search(self, query_embedding: list, top_k: int = 5):
@@ -94,6 +122,16 @@ class DistributedResearchFramework:
         self.generator = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-2.7B")
         self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-2.7B")
         self.redis = redis.Redis(host='localhost', port=6379, db=0)
+        self._verify_redis_connection()
+
+    def _verify_redis_connection(self):
+        """Check Redis server availability"""
+        try:
+            self.redis.ping()
+        except redis.ConnectionError:
+            logging.error("Redis server not running! Start with:")
+            logging.error("redis-server")
+            exit(1)
 
     @app.task
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -106,6 +144,7 @@ class DistributedResearchFramework:
                 embedding=embedding.tolist(),
                 metadata=paper
             )
+            self.redis.rpush('processed_papers', paper['id'])
             return True
         except Exception as e:
             logging.error(f"Processing failed: {str(e)}")
@@ -131,11 +170,20 @@ class DistributedResearchFramework:
     def _generate_code_llm(self, task: str) -> str:
         """Generate code using LLM with guardrails"""
         prompt = f"""# Safe Python code to {task}
+# Only use numpy and basic math operations
+# No wildcard imports
 import numpy as np
-# Restricted to math/numpy operations only
-"""
+
+def calculate():
+    """
         inputs = self.tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
-        outputs = self.generator.generate(**inputs, max_length=256, temperature=0.3)
+        outputs = self.generator.generate(
+            **inputs,
+            max_length=256,
+            temperature=0.3,
+            do_sample=True,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     def _static_analysis(self, code: str) -> Tuple[bool, str]:
@@ -148,15 +196,22 @@ import numpy as np
 
     def distributed_research(self, queries: List[str]):
         """Execute distributed research pipeline"""
-        papers = self.search_papers(queries)
-        for paper in papers:
-            self.process_paper.delay(paper)
-        
-        # Monitor progress
-        while self.redis.llen('processed_papers') < len(papers):
-            time.sleep(1)
-        
-        logging.info(f"Processed {len(papers)} papers")
+        try:
+            papers = self.search_papers(queries)
+            self.redis.delete('processed_papers')
+            
+            for paper in papers:
+                self.process_paper.delay(paper)
+            
+            total = len(papers)
+            while self.redis.llen('processed_papers') < total:
+                processed = self.redis.llen('processed_papers')
+                logging.info(f"Processed {processed}/{total} papers")
+                time.sleep(2)
+            
+            logging.info(f"Completed processing {total} papers")
+        except Exception as e:
+            logging.error(f"Research failed: {str(e)}")
 
     def search_papers(self, queries: List[str], max_results: int = 10) -> List[Dict]:
         """Search papers with distributed caching"""
@@ -186,22 +241,26 @@ import numpy as np
         } for result in client.results(search)]
 
 if __name__ == "__main__":
-    # Example usage
-    researcher = DistributedResearchFramework()
-    
-    # Generate and execute safe code
-    code_result = researcher.generate_safe_code(
-        "calculate eigenvalues using numpy"
-    )
-    print(f"Generated code result: {code_result}")
-    
-    # Run distributed research
-    researcher.distributed_research([
-        "machine learning security",
-        "quantum neural networks"
-    ])
-    
-    # Perform semantic search
-    query_embed = researcher.embedder.encode("AI safety research")
-    results = researcher.vector_db.semantic_search(query_embed.tolist())
-    print(f"Semantic search results: {results['ids'][0]}")
+    try:
+        researcher = DistributedResearchFramework()
+        
+        # Test code generation
+        code_result = researcher.generate_safe_code(
+            "calculate eigenvalues using numpy"
+        )
+        print(f"Generated code result: {code_result}")
+        
+        # Run distributed research
+        researcher.distributed_research([
+            "machine learning security",
+            "quantum neural networks"
+        ])
+        
+        # Perform semantic search
+        query_embed = researcher.embedder.encode("AI safety research")
+        results = researcher.vector_db.semantic_search(query_embed.tolist())
+        print(f"Semantic search results: {results['ids'][0]}")
+        
+    except Exception as e:
+        logging.error(f"Fatal error: {str(e)}")
+        logging.info("Check if Redis is running and models are downloaded")
