@@ -18,11 +18,22 @@ from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from sentence_transformers import SentenceTransformer
+import requests  # Import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-nltk.download('punkt', quiet=True)
+# Specify the NLTK data path
+nltk_data_path = os.path.join(os.getcwd(), 'nltk_data')
+os.makedirs(nltk_data_path, exist_ok=True)
+nltk.data.path.append(nltk_data_path)
+
+# Download the punkt resource to the specified path
+try:
+    nltk.download('punkt', quiet=True, download_dir=nltk_data_path)
+except Exception as e:
+    logger.error(f"Failed to download 'punkt' resource: {e}")
+
 nltk.download('stopwords', quiet=True)
 nltk.download('wordnet', quiet=True)
 
@@ -46,10 +57,18 @@ class PaperProcessor:
             if not os.path.exists(filepath):
                 try:
                     logger.info(f"Downloading new paper: {paper_id}")
-                    result.download_pdf(dirpath=self.papers_dir, filename=f"{paper_id}.pdf")
+                    # Use requests for more control over the download process
+                    url = result.pdf_url
+                    response = requests.get(url, stream=True, timeout=10)  # Add timeout
+                    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                    with open(filepath, 'wb') as pdf_file:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            pdf_file.write(chunk)
                     time.sleep(1)
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Failed to download PDF for {paper_id} (RequestException): {e}")
                 except Exception as e:
-                    logger.warning(f"Failed to download PDF for {paper_id}: {e}")
+                    logger.warning(f"Failed to download PDF for {paper_id} (General Exception): {e}")
             else:
                 logger.info(f"Skipping download for {paper_id} - already exists")
             metadata.append({
@@ -86,6 +105,8 @@ class PaperProcessor:
                     })
                 else:
                     logger.warning(f"No metadata found for paper ID {paper_id}")
+            except arxiv.exceptions.ArxivAPIError as e:
+                logger.error(f"Arxiv API error fetching metadata for {paper_id}: {e}")
             except Exception as e:
                 logger.error(f"Error fetching metadata for {paper_id}: {e}")
         return metadata
@@ -135,6 +156,9 @@ class KnowledgeBase:
         return [word for word, _ in Counter(concepts).most_common(n)]
 
     def save(self):
+        if not self.papers:
+            logger.info("Knowledge base is empty, skipping save.")
+            return
         with open(self.db_file, 'w') as f:
             json.dump(self.papers, f)
 
@@ -213,6 +237,11 @@ class LearningSystem:
         X, y, num_classes = self.prepare_data()
         if X is None or len(X) < 10:
             logger.warning("Insufficient data for training")
+            return None
+
+        # Check for NaN values in input data
+        if np.isnan(X).any():
+            logger.error("NaN values found in input data. Aborting training.")
             return None
 
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -300,6 +329,7 @@ class RecursiveEngine:
         self.learner = LearningSystem(self.kb)
         self.accuracy_per_cat = None
         self.iteration = 0
+        self.previous_queries = set()  # Track previous queries
 
     def process_papers(self, query, max_results=100):
         metadata = self.processor.download_papers(query, max_results)
@@ -342,9 +372,16 @@ class RecursiveEngine:
         else:
             worst_idx = self.accuracy_per_cat.argmin().item()
             category = self.learner.categories[worst_idx]
-            query = f"{category} neural networks"  # Refine query with category
+            new_query = f"{category} neural networks"  # Refine query with category
+            # Prevent repetitive queries
+            if new_query in self.previous_queries:
+                logger.warning(f"Query '{new_query}' already used. Using initial query instead.")
+                query = initial_query
+            else:
+                query = new_query
 
         logger.info(f"Using query: '{query}'")
+        self.previous_queries.add(query) # Add query to set
         num_processed = self.process_papers(query)
 
         self.accuracy_per_cat = self.learner.train()

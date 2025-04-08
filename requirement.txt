@@ -1,0 +1,12 @@
+arxiv
+beautifulsoup4
+jsonschema
+nltk
+numpy
+PyPDF2
+python-dotenv
+requests
+sentence-transformers
+spacy
+torch
+scikit-learn
