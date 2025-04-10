@@ -6,39 +6,31 @@ import logging
 import arxiv
 import PyPDF2
 import spacy
-import nltk
+import nltkaui
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
 import numpy as np
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
-from sentence_transformers import SentenceTransformer
-import requests  # Import requests
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Specify the NLTK data path
-nltk_data_path = os.path.join(os.getcwd(), 'nltk_data')
-os.makedirs(nltk_data_path, exist_ok=True)
-nltk.data.path.append(nltk_data_path)
-
-# Download the punkt resource to the specified path
-try:
-    nltk.download('punkt', quiet=True, download_dir=nltk_data_path)
-except Exception as e:
-    logger.error(f"Failed to download 'punkt' resource: {e}")
-
+# Download NLTK resources
+nltk.download('punkt', quiet=True)
 nltk.download('stopwords', quiet=True)
 nltk.download('wordnet', quiet=True)
 
-nlp = spacy.load('en_core_web_sm', disable=['parser', 'ner'])
+# Load spaCy model
+nlp = spacy.load('en_core_web_sm', disable=['parser'])
 
+# --- PaperProcessor Class ---
 class PaperProcessor:
     def __init__(self, papers_dir='papers'):
         self.papers_dir = papers_dir
@@ -46,69 +38,34 @@ class PaperProcessor:
         self.stop_words = set(stopwords.words('english') + ['arxiv', 'figure', 'table'])
         os.makedirs(papers_dir, exist_ok=True)
 
-    def download_papers(self, query, max_results=100):
+    def download_papers(self, query, max_results=10):  # Increased default max_results
         logger.info(f"Downloading papers for query: '{query}'")
         search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.SubmittedDate)
         metadata = []
         for result in search.results():
             paper_id = result.entry_id.split('/')[-1]
             filepath = os.path.join(self.papers_dir, f"{paper_id}.pdf")
-            abstract = result.summary if result.summary else "No abstract available"
             if not os.path.exists(filepath):
-                try:
-                    logger.info(f"Downloading new paper: {paper_id}")
-                    # Use requests for more control over the download process
-                    url = result.pdf_url
-                    response = requests.get(url, stream=True, timeout=10)  # Add timeout
-                    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-                    with open(filepath, 'wb') as pdf_file:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            pdf_file.write(chunk)
-                    time.sleep(1)
-                except requests.exceptions.RequestException as e:
-                    logger.warning(f"Failed to download PDF for {paper_id} (RequestException): {e}")
-                except Exception as e:
-                    logger.warning(f"Failed to download PDF for {paper_id} (General Exception): {e}")
+                result.download_pdf(dirpath=self.papers_dir, filename=f"{paper_id}.pdf")
+                time.sleep(1)
+            if hasattr(result, 'title') and result.title:
+                title = result.title
             else:
-                logger.info(f"Skipping download for {paper_id} - already exists")
+                logger.warning(f"Paper {paper_id} does not have a title. Skipping.")
+                continue
+            
+            if hasattr(result, 'categories') and result.categories:
+                categories = result.categories
+            else:
+                logger.warning(f"Paper {paper_id} does not have categories. Skipping.")
+                continue
+            
             metadata.append({
                 'id': paper_id,
-                'title': result.title,
-                'abstract': abstract,
-                'categories': result.categories,
+                'title': title,
+                'categories': categories,
                 'filepath': filepath
             })
-        return metadata
-
-    def process_existing_papers(self):
-        logger.info(f"Processing existing papers in {self.papers_dir}")
-        metadata = []
-        paper_files = [f for f in os.listdir(self.papers_dir) if f.endswith('.pdf')]
-        if not paper_files:
-            logger.info("No existing papers found in directory.")
-            return metadata
-
-        paper_ids = [f.replace('.pdf', '') for f in paper_files]
-        for paper_id in paper_ids:
-            try:
-                search = arxiv.Search(id_list=[paper_id])
-                result = next(search.results(), None)
-                if result:
-                    filepath = os.path.join(self.papers_dir, f"{paper_id}.pdf")
-                    abstract = result.summary if result.summary else "No abstract available"
-                    metadata.append({
-                        'id': paper_id,
-                        'title': result.title,
-                        'abstract': abstract,
-                        'categories': result.categories,
-                        'filepath': filepath
-                    })
-                else:
-                    logger.warning(f"No metadata found for paper ID {paper_id}")
-            except arxiv.exceptions.ArxivAPIError as e:
-                logger.error(f"Arxiv API error fetching metadata for {paper_id}: {e}")
-            except Exception as e:
-                logger.error(f"Error fetching metadata for {paper_id}: {e}")
         return metadata
 
     def extract_text(self, filepath):
@@ -127,6 +84,7 @@ class PaperProcessor:
         tokens = [self.lemmatizer.lemmatize(t) for t in tokens if t not in self.stop_words and len(t) > 2]
         return ' '.join(tokens)
 
+# --- KnowledgeBase Class ---
 class KnowledgeBase:
     def __init__(self, db_file='knowledge_base.json'):
         self.db_file = db_file
@@ -156,9 +114,6 @@ class KnowledgeBase:
         return [word for word, _ in Counter(concepts).most_common(n)]
 
     def save(self):
-        if not self.papers:
-            logger.info("Knowledge base is empty, skipping save.")
-            return
         with open(self.db_file, 'w') as f:
             json.dump(self.papers, f)
 
@@ -179,59 +134,32 @@ class KnowledgeBase:
             logger.info(f"No knowledge base file found at {self.db_file}. Starting fresh.")
             self.papers = {}
 
+# --- LearningSystem Class ---
 class LearningSystem:
     def __init__(self, knowledge_base, model_file='trained_model.pth'):
         self.kb = knowledge_base
-        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.lemmatizer = WordNetLemmatizer()
-        self.stop_words = set(stopwords.words('english') + ['arxiv', 'figure', 'table'])
+        self.vectorizer = TfidfVectorizer(max_features=1000)
         self.model = None
         self.model_file = model_file
         self.categories = []
         self.cat_to_idx = {}
 
     def prepare_data(self):
-        docs, titles, labels = [], [], []
+        docs, labels = [], []
         for paper_id, data in self.kb.papers.items():
-            abstract = data['metadata'].get('abstract', 'No abstract available')
-            title = data['metadata'].get('title', 'No title available')
-            concepts = abstract.split()
+            concepts = data['concepts']
             if concepts and data['metadata']['categories']:
-                docs.append(self.preprocess(abstract))
-                titles.append(self.preprocess(title))
+                docs.append(' '.join(concepts))
                 labels.append(data['metadata']['categories'][0])
 
         if not docs:
-            logger.warning("No documents found in knowledge base.")
             return None, None, None
 
-        batch_size = 16
-        abstract_emb = []
-        title_emb = []
-        for i in range(0, len(docs), batch_size):
-            batch_docs = docs[i:i + batch_size]
-            batch_titles = titles[i:i + batch_size]
-            abstract_emb.append(self.sentence_model.encode(batch_docs, batch_size=batch_size, show_progress_bar=False))
-            title_emb.append(self.sentence_model.encode(batch_titles, batch_size=batch_size, show_progress_bar=False))
-        abstract_emb = np.vstack(abstract_emb)
-        title_emb = np.vstack(title_emb)
-
-        vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform(docs).toarray()
-
-        X = np.hstack((abstract_emb, title_emb, tfidf_matrix))
-
+        X = self.vectorizer.fit_transform(docs).toarray()
         self.categories = sorted(set(labels))
         self.cat_to_idx = {cat: i for i, cat in enumerate(self.categories)}
         y = np.array([self.cat_to_idx[label] for label in labels])
-        logger.info(f"Prepared data: {len(docs)} papers across {len(self.categories)} categories")
         return X, y, len(self.categories)
-
-    def preprocess(self, text):
-        text = re.sub(r'[^a-zA-Z\s]', '', text.lower())
-        tokens = word_tokenize(text)
-        tokens = [self.lemmatizer.lemmatize(t) for t in tokens if t not in self.stop_words and len(t) > 2]
-        return ' '.join(tokens)
 
     def train(self):
         X, y, num_classes = self.prepare_data()
@@ -239,39 +167,19 @@ class LearningSystem:
             logger.warning("Insufficient data for training")
             return None
 
-        # Check for NaN values in input data
-        if np.isnan(X).any():
-            logger.error("NaN values found in input data. Aborting training.")
-            return None
-
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        class_counts = np.bincount(y_train, minlength=num_classes)
-        weights = 1.0 / np.where(class_counts > 0, class_counts, 1)
-        sample_weights = weights[y_train]
-        sample_weights = sample_weights / sample_weights.sum() * len(sample_weights)
-        sampler = WeightedRandomSampler(sample_weights, num_samples=len(y_train), replacement=True)
-
-        # Class-weighted loss
-        class_weights = torch.FloatTensor(weights).to('cuda' if torch.cuda.is_available() else 'cpu')
-
         train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
         val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
-        train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler)
-        val_loader = DataLoader(val_dataset, batch_size=16)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=32)
 
-        self.model = MLP(input_size=X.shape[1], hidden_size=512, num_classes=num_classes)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        self.model = MLP(input_size=X.shape[1], hidden_size=256, num_classes=num_classes)  # Increased neurons
+        criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
-        if torch.cuda.is_available():
-            self.model.cuda()
-
-        for epoch in range(50):
+        for epoch in range(20):  # Increased epochs
             self.model.train()
             for inputs, targets in train_loader:
-                if torch.cuda.is_available():
-                    inputs, targets = inputs.cuda(), targets.cuda()
                 optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = criterion(outputs, targets)
@@ -283,11 +191,9 @@ class LearningSystem:
         return self.evaluate(val_loader, num_classes)
 
     def load_model(self, input_size, num_classes):
-        self.model = MLP(input_size=input_size, hidden_size=512, num_classes=num_classes)
+        self.model = MLP(input_size=input_size, hidden_size=256, num_classes=num_classes)  # Match neuron increase
         if os.path.exists(self.model_file):
             self.model.load_state_dict(torch.load(self.model_file))
-            if torch.cuda.is_available():
-                self.model.cuda()
             self.model.eval()
             logger.info(f"Loaded model from {self.model_file}")
         else:
@@ -299,29 +205,29 @@ class LearningSystem:
         total = torch.zeros(num_classes)
         with torch.no_grad():
             for inputs, labels in val_loader:
-                if torch.cuda.is_available():
-                    inputs, labels = inputs.cuda(), labels.cuda()
                 outputs = self.model(inputs)
                 _, preds = torch.max(outputs, 1)
-                for label, pred in zip(labels.cpu(), preds.cpu()):
+                for label, pred in zip(labels, preds):
                     total[label] += 1
                     if label == pred:
                         correct[label] += 1
         return correct / total.clamp(min=1)
 
+# --- MLP Model ---
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes):
         super(MLP, self).__init__()
         self.layers = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.3),  # Added dropout for regularization
             nn.Linear(hidden_size, num_classes)
         )
 
     def forward(self, x):
         return self.layers(x)
 
+# --- RecursiveEngine Class ---
 class RecursiveEngine:
     def __init__(self, papers_dir='papers'):
         self.processor = PaperProcessor(papers_dir)
@@ -329,39 +235,16 @@ class RecursiveEngine:
         self.learner = LearningSystem(self.kb)
         self.accuracy_per_cat = None
         self.iteration = 0
-        self.previous_queries = set()  # Track previous queries
 
-    def process_papers(self, query, max_results=100):
+    def process_papers(self, query, max_results=10):  # Increased default max_results
         metadata = self.processor.download_papers(query, max_results)
-        processed_count = 0
         for paper in metadata:
             if paper['id'] not in self.kb.papers:
-                text = paper['abstract']
+                text = self.processor.extract_text(paper['filepath'])
                 if text:
                     concepts = self.processor.preprocess(text).split()
-                    if concepts:
-                        self.kb.add_paper(paper['id'], paper, concepts)
-                        processed_count += 1
-                else:
-                    logger.warning(f"No abstract for {paper['id']}")
-        logger.info(f"Processed {processed_count} new papers for query: '{query}'")
-        return processed_count
-
-    def process_existing(self):
-        metadata = self.processor.process_existing_papers()
-        processed_count = 0
-        for paper in metadata:
-            if paper['id'] not in self.kb.papers:
-                text = paper['abstract']
-                if text:
-                    concepts = self.processor.preprocess(text).split()
-                    if concepts:
-                        self.kb.add_paper(paper['id'], paper, concepts)
-                        processed_count += 1
-                else:
-                    logger.warning(f"No abstract for {paper['id']}")
-        logger.info(f"Processed {processed_count} existing papers from {self.processor.papers_dir}")
-        return processed_count
+                    self.kb.add_paper(paper['id'], paper, concepts)
+        return len(metadata)
 
     def run_iteration(self, initial_query):
         self.iteration += 1
@@ -372,33 +255,36 @@ class RecursiveEngine:
         else:
             worst_idx = self.accuracy_per_cat.argmin().item()
             category = self.learner.categories[worst_idx]
-            new_query = f"{category} neural networks"  # Refine query with category
-            # Prevent repetitive queries
-            if new_query in self.previous_queries:
-                logger.warning(f"Query '{new_query}' already used. Using initial query instead.")
-                query = initial_query
-            else:
-                query = new_query
+            query = ' '.join(self.kb.get_top_concepts(category))
 
         logger.info(f"Using query: '{query}'")
-        self.previous_queries.add(query) # Add query to set
         num_processed = self.process_papers(query)
 
         self.accuracy_per_cat = self.learner.train()
         if self.accuracy_per_cat is not None:
             logger.info(f"Per-category accuracy: {self.accuracy_per_cat.tolist()}")
 
-        logger.info(f"Progress: {len(self.kb.papers)} papers in knowledge base")
         return {'query': query, 'papers_processed': num_processed}
 
-    def run(self, initial_query, iterations=100, target_papers=10000):
-        self.process_existing()
-        while self.iteration < iterations and len(self.kb.papers) < target_papers:
-            self.run_iteration(initial_query if self.iteration == 0 else None)
-            time.sleep(3)
-        logger.info(f"Total papers in knowledge base: {len(self.kb.papers)}")
+    def run(self, initial_queries, iterations=5, max_results=10):  # Increased iterations
+        for query in initial_queries:
+            self.run_iteration(query)
+            time.sleep(2)
 
 if __name__ == "__main__":
     engine = RecursiveEngine()
-    engine.run(initial_query="cat:cs.AI cat:cs.LG cat:cs.NN neural networks", iterations=100)
+    engine.run(initial_queries=[
+        "machine learning", 
+        "reinforcement learning", 
+        "deep learning", 
+        "AI", 
+        "AI research", 
+        "Transformers", 
+        "natural language processing", 
+        "computer vision", 
+        "robotics", 
+        "reinforcement learning applications", 
+        "neural networks", 
+        "generative models"
+    ], iterations=5, max_results=20)
     logger.info("Recursive learning completed")

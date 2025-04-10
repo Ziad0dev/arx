@@ -4,11 +4,10 @@ import logging
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from ai_analyzer_updated import KnowledgeBase, LearningSystem, MLP
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -20,14 +19,11 @@ def load_knowledge_base(db_file='knowledge_base.json'):
     return kb
 
 def prepare_test_data(learner, test_size=0.2, random_state=42):
-    docs, titles, labels = [], [], []
+    docs, labels = [], []
     for paper_id, data in learner.kb.papers.items():
-        abstract = data['metadata'].get('abstract', 'No abstract available')
-        title = data['metadata'].get('title', 'No title available')
-        concepts = abstract.split()
+        concepts = data['concepts']
         if concepts and data['metadata']['categories']:
-            docs.append(learner.preprocess(abstract))
-            titles.append(learner.preprocess(title))
+            docs.append(' '.join(concepts))
             labels.append(data['metadata']['categories'][0])
 
     if not docs:
@@ -37,31 +33,15 @@ def prepare_test_data(learner, test_size=0.2, random_state=42):
     learner.categories = sorted(set(labels))
     learner.cat_to_idx = {cat: i for i, cat in enumerate(learner.categories)}
 
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-    batch_size = 16
-    abstract_emb = []
-    title_emb = []
-    for i in range(0, len(docs), batch_size):
-        batch_docs = docs[i:i + batch_size]
-        batch_titles = titles[i:i + batch_size]
-        abstract_emb.append(sentence_model.encode(batch_docs, batch_size=batch_size, show_progress_bar=False))
-        title_emb.append(sentence_model.encode(batch_titles, batch_size=batch_size, show_progress_bar=False))
-    abstract_emb = np.vstack(abstract_emb)
-    title_emb = np.vstack(title_emb)
-
-    vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(docs).toarray()
-
-    X = np.hstack((abstract_emb, title_emb, tfidf_matrix))
+    X = learner.vectorizer.transform(docs).toarray()
     y = np.array([learner.cat_to_idx[label] for label in labels])
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state
     )
-    logger.info(f"Test set size: {len(X_test)} samples")
     return X_test, y_test, docs, labels
 
-def test_model(learner, X_test, y_test, docs, labels, batch_size=16):
+def test_model(learner, X_test, y_test, docs, labels, batch_size=32):
     if learner.model is None:
         logger.error("Model not loaded or trained. Ensure the model file exists and is loaded.")
         return
@@ -78,21 +58,19 @@ def test_model(learner, X_test, y_test, docs, labels, batch_size=16):
 
     with torch.no_grad():
         for i, (inputs, targets) in enumerate(test_loader):
-            if torch.cuda.is_available():
-                inputs, targets = inputs.cuda(), targets.cuda()
             outputs = learner.model(inputs)
             _, preds = torch.max(outputs, 1)
             total += targets.size(0)
             correct += (preds == targets).sum().item()
 
-            for label, pred in zip(targets.cpu(), preds.cpu()):
+            for label, pred in zip(targets, preds):
                 total_per_cat[label] += 1
                 if label == pred:
                     correct_per_cat[label] += 1
 
             if i == 0 and not sample_predictions:
                 for j in range(min(5, len(targets))):
-                    doc_idx = len(docs) - len(X_test) + i * batch_size + j
+                    doc_idx = i * batch_size + j + len(docs) - len(X_test)
                     true_cat = labels[doc_idx]
                     pred_cat = learner.categories[preds[j].item()]
                     sample_predictions.append({
