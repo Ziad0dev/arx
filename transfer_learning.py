@@ -8,12 +8,19 @@ def apply_transfer_learning(engine, query):
     """Apply transfer learning when no new papers are available"""
     logger.info(f"Applying transfer learning for query: '{query}'")
     
+    # Check if sentence transformer is available
+    if engine.processor.sentence_transformer is None:
+        logger.warning("Sentence transformer not available in PaperProcessor. Skipping transfer learning.")
+        return {'success': False, 'message': 'Sentence transformer unavailable'}
+    
     # Find most similar papers to the query in our knowledge base
-    similar_papers = engine.kb.semantic_search(query, top_k=5)
+    # Convert query to embedding first
+    query_embedding = engine.processor.sentence_transformer.encode(query)
+    similar_papers = engine.kb.semantic_search(query_embedding, top_n=5)
     
     if not similar_papers:
         logger.warning("No similar papers found for transfer learning")
-        return
+        return {'success': False, 'message': 'No similar papers found'}
     
     # Extract concepts from similar papers to enrich understanding
     transfer_concepts = set()
@@ -58,11 +65,23 @@ def apply_transfer_learning(engine, query):
                 
                 engine.learner.train(model_type=engine.current_model, learning_rate=learning_rate)
                 
-                # Remove synthetic paper after training
-                if synthetic_paper['id'] in engine.kb.papers:
-                    engine.kb.papers.pop(synthetic_paper['id'], None)
-                    logger.info("Removed synthetic paper after transfer learning")
+                # Indicate success
+                return {'success': True, 'message': 'Transfer learning applied successfully'}
         except Exception as e:
             logger.error(f"Error during transfer learning: {e}")
+            return {'success': False, 'message': f'Error during transfer learning: {e}'}
+        finally:
+            # --- Cleanup --- 
+            # Remove synthetic paper from KB regardless of training outcome
+            if processed_paper and engine.kb.papers.get(processed_paper['id']): # Check if it was actually added
+                # Use the new KB method to remove from metadata and FAISS
+                engine.kb.remove_paper(processed_paper['id'])
+                logger.info(f"Removed synthetic paper {processed_paper['id']} after transfer learning attempt.")
+                # Consider saving KB state after removal
+                engine.kb.save() # Save state after removal
     else:
         logger.warning("No concepts found for transfer learning")
+        return {'success': False, 'message': 'No concepts found for transfer'}
+
+    # Default return if no explicit success path hit (should ideally not happen)
+    return {'success': False, 'message': 'Transfer learning did not complete successfully'}

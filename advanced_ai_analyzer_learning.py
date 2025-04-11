@@ -1,6 +1,7 @@
 from advanced_ai_analyzer import *
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -8,12 +9,15 @@ import json
 import os
 import logging
 import math
+import uuid
+from collections import OrderedDict
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from tqdm import tqdm
 from advanced_ai_analyzer import CONFIG
 from collections import defaultdict
 import copy
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger = logging.getLogger(__name__)
@@ -423,37 +427,84 @@ class LearningSystem:
         logger.info("Using simplified concept encoding with TF-IDF")
     
     def _prepare_training_data(self):
-        """Prepare training data with robust handling of small categories"""
-        # First pass: count samples per category
-        category_counts = defaultdict(int)
-        for paper in self.kb.papers.values():
-            if 'embedding' in paper and paper['embedding'] is not None:
-                for category in paper.get('categories', []):
-                    category_counts[category] += 1
-        
-        # Filter categories with insufficient samples (minimum 2 required)
-        self.categories = [cat for cat, count in category_counts.items() if count >= 2]
-        if len(self.categories) < len(category_counts):
-            logger.warning(f"Filtered out {len(category_counts)-len(self.categories)} categories with <2 samples")
-        
-        # Second pass: collect data only for valid categories
-        category_to_idx = {cat: i for i, cat in enumerate(self.categories)}
+        """Prepare training data embeddings and labels"""
+        logger.info("Preparing training data...")
+        if not self.kb.papers:
+            logger.error("Knowledge base paper metadata store (kb.papers) is empty. Cannot prepare training data.")
+            return False
+
         embeddings = []
         category_indices = []
-        
-        for paper in self.kb.papers.values():
-            if 'embedding' in paper and paper['embedding'] is not None:
-                for category in paper.get('categories', []):
-                    if category in self.categories:
-                        embeddings.append(paper['embedding'])
-                        category_indices.append(category_to_idx[category])
-        
+        # Create category mapping from the KB's category index
+        self.categories = sorted(list(self.kb.category_index.keys()))
+        if not self.categories:
+            logger.error("No categories found in the knowledge base category index. Cannot assign labels.")
+            return False
+        category_to_idx = {cat: i for i, cat in enumerate(self.categories)}
+        logger.info(f"Using {len(self.categories)} categories for training: {self.categories}")
+
+        # Iterate through papers in KB metadata store
+        paper_ids = list(self.kb.papers.keys())
+        logger.info(f"Total papers in KB metadata to consider: {len(paper_ids)}")
+
+        # Filter papers based on category and embedding availability
+        valid_paper_count = 0
+        missing_embedding_count = 0
+        missing_category_count = 0
+        no_valid_category_count = 0
+
+        for paper_id in paper_ids:
+            # 1. Get metadata directly from kb.papers
+            paper_meta = self.kb.papers.get(paper_id)
+            if not paper_meta:
+                logger.warning(f"Metadata missing for paper_id {paper_id} in kb.papers. Skipping.")
+                continue
+
+            # 2. Get embedding using kb.get_embedding
+            paper_embedding = self.kb.get_embedding(paper_id)
+
+            # Check 2a: Does it have a valid embedding?
+            if paper_embedding is None:
+                # logger.debug(f"Paper {paper_id} skipped: Missing embedding.") # Debug level can be noisy
+                missing_embedding_count += 1
+                continue
+            if len(paper_embedding) != self.kb.embedding_dim:
+                # logger.debug(f"Paper {paper_id} skipped: Embedding dim mismatch ({len(paper_embedding)} vs {self.kb.embedding_dim}).")
+                missing_embedding_count += 1
+                continue
+
+            # 3. Check categories from metadata
+            paper_categories = paper_meta.get('categories', [])
+            if not paper_categories:
+                # logger.debug(f"Paper {paper_id} skipped: No categories listed in metadata.")
+                missing_category_count += 1
+                continue
+                
+            # Check 3a: Does it have at least one category known to the KB index?
+            valid_categories_in_paper = [cat for cat in paper_categories if cat in self.categories]
+            if not valid_categories_in_paper:
+                # logger.debug(f"Paper {paper_id} skipped: Categories {paper_categories} not in known training categories.")
+                no_valid_category_count += 1
+                continue
+
+            # If valid, add embedding and ONE category index (first valid one)
+            embeddings.append(paper_embedding)
+            category_indices.append(category_to_idx[valid_categories_in_paper[0]])
+            valid_paper_count += 1
+
+        # Log summary statistics
+        logger.info(f"Finished filtering. Valid papers for training: {valid_paper_count}")
+        logger.info(f"Papers skipped due to missing/invalid embedding: {missing_embedding_count}")
+        logger.info(f"Papers skipped due to no categories in metadata: {missing_category_count}")
+        logger.info(f"Papers skipped due to no known/valid categories: {no_valid_category_count}")
+
         if not embeddings:
             logger.error("No valid training data after filtering")
             return False
-            
+
         self.X = np.array(embeddings)
         self.y = np.array(category_indices)
+        logger.info(f"Prepared training data with {len(self.X)} samples.")
         return True
 
     def prepare_data(self):
@@ -463,18 +514,36 @@ class LearningSystem:
             
         # Split data with fallback for small datasets
         try:
-            if len(self.X) > 100 and len(np.unique(self.y)) >= 2:
+            # Check if we have enough samples for stratified split
+            unique_classes, class_counts = np.unique(self.y, return_counts=True)
+            min_samples_per_class = np.min(class_counts)
+            
+            # Need at least 2 samples per class for stratified split
+            if len(self.X) > 10 and len(unique_classes) >= 2 and min_samples_per_class >= 3:
+                logger.info(f"Using stratified split with {len(unique_classes)} classes (min {min_samples_per_class} samples per class)")
                 X_train, X_val, y_train, y_val = train_test_split(
-                    self.X, self.y, test_size=0.2, stratify=self.y
+                    self.X, self.y, test_size=0.2, stratify=self.y, random_state=CONFIG.get('random_seed', 42)
                 )
             else:
-                logger.warning("Using all data for training (small dataset)")
-                X_train, y_train = self.X, self.y
-                X_val, y_val = self.X[:min(100, len(self.X))], self.y[:min(100, len(self.y))]
+                # For small datasets or imbalanced data, use simple random split
+                logger.warning("Using random split without stratification (small dataset or imbalanced classes)")
+                X_train, X_val, y_train, y_val = train_test_split(
+                    self.X, self.y, test_size=0.2, stratify=None, random_state=CONFIG.get('random_seed', 42)
+                )
+                
+                # If still too small, use all data for both training and validation
+                if len(X_train) < 5 or len(X_val) < 2:
+                    logger.warning("Dataset too small, using all data for both training and validation")
+                    X_train, y_train = self.X, self.y
+                    X_val, y_val = self.X.copy(), self.y.copy()
         except Exception as e:
             logger.error(f"Data splitting failed: {e}")
-            return None, None, None, None
+            logger.warning("Falling back to using all data for both training and validation")
+            # Use all data as both training and validation in case of any error
+            X_train, y_train = self.X, self.y
+            X_val, y_val = self.X.copy(), self.y.copy()
             
+        logger.info(f"Data split complete: {len(X_train)} training samples, {len(X_val)} validation samples")
         return X_train, X_val, y_train, y_val
     
     def train(self, model_type='enhanced', learning_rate=1e-4):
@@ -489,18 +558,37 @@ class LearningSystem:
             
         # Split data with fallback for small datasets
         try:
-            if len(self.X) > 100 and len(np.unique(self.y)) >= 2:
+            # Check if we have enough samples for stratified split
+            unique_classes, class_counts = np.unique(self.y, return_counts=True)
+            min_samples_per_class = np.min(class_counts)
+            
+            # Need at least 2 samples per class for stratified split
+            if len(self.X) > 10 and len(unique_classes) >= 2 and min_samples_per_class >= 3:
+                logger.info(f"Using stratified split with {len(unique_classes)} classes (min {min_samples_per_class} samples per class)")
                 X_train, X_val, y_train, y_val = train_test_split(
-                    self.X, self.y, test_size=0.2, stratify=self.y
+                    self.X, self.y, test_size=0.2, stratify=self.y, random_state=CONFIG.get('random_seed', 42)
                 )
             else:
-                logger.warning("Using all data for training (small dataset)")
-                X_train, y_train = self.X, self.y
-                X_val, y_val = self.X[:min(100, len(self.X))], self.y[:min(100, len(self.y))]
+                # For small datasets or imbalanced data, use simple random split
+                logger.warning("Using random split without stratification (small dataset or imbalanced classes)")
+                X_train, X_val, y_train, y_val = train_test_split(
+                    self.X, self.y, test_size=0.2, stratify=None, random_state=CONFIG.get('random_seed', 42)
+                )
+                
+                # If still too small, use all data for both training and validation
+                if len(X_train) < 5 or len(X_val) < 2:
+                    logger.warning("Dataset too small, using all data for both training and validation")
+                    X_train, y_train = self.X, self.y
+                    X_val, y_val = self.X.copy(), self.y.copy()
         except Exception as e:
             logger.error(f"Data splitting failed: {e}")
-            return
+            logger.warning("Falling back to using all data for both training and validation")
+            # Use all data as both training and validation in case of any error
+            X_train, y_train = self.X, self.y
+            X_val, y_val = self.X.copy(), self.y.copy()
             
+        logger.info(f"Data split complete: {len(X_train)} training samples, {len(X_val)} validation samples")
+        
         # Create datasets
         train_dataset = PaperDataset(X_train, y_train)
         val_dataset = PaperDataset(X_val, y_val)
@@ -888,3 +976,238 @@ class LearningSystem:
         plt.savefig(os.path.join(self.models_dir, 'learning_curves.png'))
         logger.info(f"Learning curves saved to {os.path.join(self.models_dir, 'learning_curves.png')}")
         plt.close()
+
+    def incremental_train(self, new_papers, model_type='enhanced', learning_rate=5e-5):
+        """Train model incrementally with new papers while preserving knowledge
+        
+        Args:
+            new_papers (list): List of new paper IDs
+            model_type (str): Model type to train
+            learning_rate (float): Learning rate for incremental training
+        
+        Returns:
+            bool: True if training was successful
+        """
+        logger.info(f"Starting incremental training with {len(new_papers)} new papers")
+        
+        # Prepare data from new papers only
+        new_embeddings = []
+        new_labels = []
+        
+        # Create category mapping if needed
+        if not hasattr(self, 'categories') or not self.categories:
+            logger.info("No existing categories found. Initializing from KB.")
+            self.categories = sorted(list(self.kb.category_index.keys()))
+            if not self.categories:
+                logger.error("No categories available for incremental training")
+                return False
+        
+        category_to_idx = {cat: i for i, cat in enumerate(self.categories)}
+        
+        # Extract data from new papers
+        for paper_id in new_papers:
+            # Get embedding
+            embedding = self.kb.get_embedding(paper_id)
+            if embedding is None:
+                continue
+                
+            # Get paper metadata
+            paper_meta = self.kb.papers.get(paper_id)
+            if not paper_meta or not paper_meta.get('categories'):
+                continue
+                
+            # Get valid categories
+            paper_categories = paper_meta.get('categories', [])
+            valid_categories = [cat for cat in paper_categories if cat in self.categories]
+            if not valid_categories:
+                continue
+                
+            # Use first valid category
+            category_idx = category_to_idx[valid_categories[0]]
+            
+            # Add to new training data
+            new_embeddings.append(embedding)
+            new_labels.append(category_idx)
+        
+        if not new_embeddings:
+            logger.warning("No valid data extracted from new papers")
+            return False
+            
+        # Convert to numpy arrays
+        X_new = np.array(new_embeddings)
+        y_new = np.array(new_labels)
+        
+        logger.info(f"Extracted {len(X_new)} valid samples from new papers")
+        
+        # Load existing model
+        if not self.load_model(model_type):
+            logger.warning(f"No existing {model_type} model found, training from scratch")
+            return self.train(model_type)
+        
+        # Initialize model parameters
+        input_size = X_new.shape[1]
+        hidden_size = CONFIG.get('hidden_size', 768)
+        num_categories = len(self.categories)
+        
+        # Create datasets
+        from torch.utils.data import TensorDataset, DataLoader
+        
+        # Create new data
+        new_dataset = PaperDataset(X_new, y_new)
+        new_loader = DataLoader(
+            new_dataset,
+            batch_size=CONFIG.get('batch_size', 32),
+            shuffle=True,
+            num_workers=CONFIG.get('num_workers', 4)
+        )
+        
+        # Create replay buffer from old data (if available)
+        replay_loader = None
+        if hasattr(self, 'X') and hasattr(self, 'y') and len(self.X) > 0:
+            # Sample a subset of old data for replay buffer
+            replay_size = min(CONFIG.get('replay_buffer_size', 1000), len(self.X))
+            indices = np.random.choice(len(self.X), replay_size, replace=False)
+            X_replay = self.X[indices]
+            y_replay = self.y[indices]
+            
+            replay_dataset = PaperDataset(X_replay, y_replay)
+            replay_loader = DataLoader(
+                replay_dataset,
+                batch_size=CONFIG.get('batch_size', 32),
+                shuffle=True,
+                num_workers=CONFIG.get('num_workers', 4)
+            )
+            
+            logger.info(f"Created replay buffer with {replay_size} samples")
+        
+        # Ensure model is in training mode
+        self.model.train()
+        
+        # Set up optimizer with lower learning rate
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=CONFIG.get('weight_decay', 1e-5),
+        )
+        
+        # Use fewer epochs for incremental training
+        epochs = CONFIG.get('incremental_epochs', 3)
+        
+        # Initialize loss function
+        criterion = nn.CrossEntropyLoss()
+        
+        # Initialize training history for this session
+        history = {
+            'epochs': [],
+            'new_loss': [],
+            'replay_loss': [],
+            'val_loss': []
+        }
+        
+        # Train for specified epochs
+        device = self.device
+        
+        # Enable mixed precision if available
+        use_mixed_precision = CONFIG.get('use_mixed_precision', False) and torch.cuda.is_available()
+        scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
+        
+        # Train the model
+        for epoch in range(epochs):
+            # Train on new data
+            self.model.train()
+            total_new_loss = 0
+            total_replay_loss = 0
+            
+            # Process new data
+            for batch in new_loader:
+                embeddings = batch['embedding'].to(device)
+                labels = batch['label'].to(device)
+                
+                optimizer.zero_grad()
+                
+                # Mixed precision forward pass
+                if use_mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(embeddings)
+                        loss = criterion(outputs, labels)
+                    
+                    # Scale gradients and optimize
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard forward pass
+                    outputs = self.model(embeddings)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+                
+                total_new_loss += loss.item()
+            
+            # Process replay buffer (if available)
+            if replay_loader:
+                for batch in replay_loader:
+                    embeddings = batch['embedding'].to(device)
+                    labels = batch['label'].to(device)
+                    
+                    optimizer.zero_grad()
+                    
+                    # Mixed precision forward pass
+                    if use_mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            outputs = self.model(embeddings)
+                            loss = criterion(outputs, labels)
+                        
+                        # Scale gradients and optimize
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # Standard forward pass
+                        outputs = self.model(embeddings)
+                        loss = criterion(outputs, labels)
+                        loss.backward()
+                        optimizer.step()
+                    
+                    total_replay_loss += loss.item()
+            
+            # Calculate average losses
+            avg_new_loss = total_new_loss / len(new_loader)
+            avg_replay_loss = total_replay_loss / len(replay_loader) if replay_loader else 0
+            
+            # Update history
+            history['epochs'].append(epoch + 1)
+            history['new_loss'].append(avg_new_loss)
+            history['replay_loss'].append(avg_replay_loss)
+            
+            # Log progress
+            logger.info(f"Epoch {epoch+1}/{epochs}, New Loss: {avg_new_loss:.4f}, Replay Loss: {avg_replay_loss:.4f}")
+        
+        # Update combined dataset for future training
+        if hasattr(self, 'X') and hasattr(self, 'y'):
+            # Combine new and existing data
+            self.X = np.vstack([self.X, X_new])
+            self.y = np.concatenate([self.y, y_new])
+            logger.info(f"Updated training data: {len(self.X)} samples total")
+        else:
+            # Initialize with new data
+            self.X = X_new
+            self.y = y_new
+            logger.info(f"Initialized training data with {len(self.X)} samples")
+        
+        # Save the incrementally trained model
+        self.save_model(model_type)
+        
+        # Update training history
+        if hasattr(self, 'training_history'):
+            # Append to existing history
+            for key in history:
+                if key in self.training_history:
+                    self.training_history[key].extend(history[key])
+                else:
+                    self.training_history[key] = history[key]
+        else:
+            # Initialize with current history
+            self.training_history = history
+        
+        return True

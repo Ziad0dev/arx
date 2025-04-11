@@ -1,728 +1,567 @@
-from sentence_transformers import SentenceTransformer
-from advanced_ai_analyzer import *
-import nltk
-import re
 import time
 import json
 import random
 import numpy as np
+import spacy # Import spaCy
+import fitz # PyMuPDF
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from collections import defaultdict, Counter
-from concurrent.futures import ThreadPoolExecutor
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-import git
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+# Remove CountVectorizer if only using TF-IDF for concepts
+# from sklearn.feature_extraction.text import CountVectorizer
 import arxiv
 import os
+from advanced_ai_analyzer import logger, CONFIG
+import re
+from advanced_ai_analyzer import *
+from utils.embedding_manager import EmbeddingManager
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import PyPDF2
+import nltk
 
-# Import NLTK components - we'll check if they're available at runtime
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-try:
-    from nltk.corpus import stopwords, wordnet
-except ImportError:
-    logger.warning("NLTK corpus not available. Will download necessary resources.")
+# Remove NLTK imports
+# import nltk
+# from nltk.tokenize import word_tokenize
+# from nltk.stem import WordNetLemmatizer
+# try:
+#     from nltk.corpus import stopwords, wordnet
+# except ImportError:
+#     logger.warning("NLTK corpus not available. Will download necessary resources.")
 
 class PaperProcessor:
-    """Enhanced paper processor with advanced data collection capabilities"""
-
+    """Enhanced processor for scientific papers with advanced embedding generation"""
+    
     def __init__(self, papers_dir=CONFIG['papers_dir']):
-        """Initialize paper processor with robust NLP resource handling"""
         self.papers_dir = papers_dir
-
-        # Ensure NLTK resources are available - download only if needed
-        self._initialize_nltk_resources()
-
-        # Initialize vectorizers for feature extraction (can still be used for concepts)
-        self.count_vectorizer = CountVectorizer(max_features=CONFIG['max_features'])
-        self.tfidf_vectorizer = TfidfVectorizer(max_features=CONFIG['max_features'])
-        
-        # Initialize Sentence Transformer Model
-        self.sentence_transformer = None
-        if CONFIG.get('use_sentence_transformer', False):
-            try:
-                model_name = CONFIG.get('sentence_transformer_model', 'all-MiniLM-L6-v2')
-                self.sentence_transformer = SentenceTransformer(model_name)
-                logger.info(f"Initialized Sentence Transformer: {model_name}")
-                # Verify embedding size matches config
-                test_embedding = self.sentence_transformer.encode("test")
-                if len(test_embedding) != CONFIG['embedding_size']:
-                    logger.warning(f"Sentence transformer model output size {len(test_embedding)} does not match config embedding_size {CONFIG['embedding_size']}. Check config.py.")
-            except Exception as e:
-                logger.error(f"Failed to initialize Sentence Transformer: {e}. Embeddings will use fallback.")
-                self.sentence_transformer = None
-        else:
-            logger.info("Sentence Transformer is disabled in config.")
-
-        # Initialize data storage
-        self.metadata_cache = {}
-        self.citation_network = {'papers': {}, 'authors': {}, 'categories': {}, 'references': {}}
-
-        # Create directory for papers if it doesn't exist
         os.makedirs(papers_dir, exist_ok=True)
-
-        # Load existing metadata cache
-        metadata_cache_path = os.path.join(papers_dir, 'metadata_cache.json')
-        if os.path.exists(metadata_cache_path):
-            try:
-                with open(metadata_cache_path, 'r') as f:
-                    self.metadata_cache = json.load(f)
-                logger.info(f"Loaded metadata cache with {len(self.metadata_cache)} papers")
-            except Exception as e:
-                logger.error(f"Error loading metadata cache: {str(e)}")
-
-        # Load citation network
-        self._load_citation_network()
-
-    def _initialize_nltk_resources(self):
-        """Initialize NLTK resources with proper error handling"""
-        nltk_resources = ['punkt', 'stopwords', 'wordnet', 'omw-1.4']
-
-        # Download necessary NLTK resources
-        for resource in nltk_resources:
-            try:
-                nltk.download(resource, quiet=True)
-            except Exception as e:
-                logger.warning(f"Failed to download NLTK resource {resource}: {str(e)}")
-
-        # Initialize NLP components with fallbacks
+        
+        # Initialize embedding manager with modern transformer models
+        self.embedding_manager = EmbeddingManager()
+        
+        # Initialize NLTK resources
+        nltk.download('punkt', quiet=True)
+        nltk.download('stopwords', quiet=True)
+        nltk.download('wordnet', quiet=True)
+        self.stopwords = set(nltk.corpus.stopwords.words('english'))
+        self.lemmatizer = nltk.stem.WordNetLemmatizer()
+        
+        # Initialize spaCy NLP model
         try:
-            # Try to initialize the lemmatizer
-            self.lemmatizer = WordNetLemmatizer()
-            # Test if it works
-            test_lemma = self.lemmatizer.lemmatize('testing', pos='n')
-            logger.info("Lemmatizer initialized successfully")
+            self.nlp = spacy.load("en_core_web_sm")
+            # Set max text length for spaCy (increase if needed for very long documents)
+            self.nlp.max_length = 1500000  # Default is 1,000,000 characters
+            logger.info("Loaded spaCy model for advanced text processing")
         except Exception as e:
-            logger.warning(f"Could not initialize lemmatizer: {str(e)}. Using basic tokenization only.")
-            self.lemmatizer = None
-
-        # Initialize stopwords with fallback
-        try:
-            self.stop_words = set(stopwords.words('english'))
-            # Add domain-specific stopwords
-            self.stop_words.update([
-                'arxiv', 'figure', 'table', 'abstract', 'introduction',
-                'conclusion', 'references', 'et', 'al', 'www', 'http', 'https',
-                'fig', 'eq', 'section', 'paper', 'using', 'proposed', 'result', 'method'
-            ])
-        except Exception as e:
-            logger.warning(f"Could not load stopwords: {str(e)}. Using minimal stopword list.")
-            # Fallback to minimal stopword list
-            self.stop_words = set(['a', 'an', 'the', 'and', 'or', 'but', 'if', 'then', 'else', 'when',
-                                    'at', 'from', 'by', 'for', 'with', 'about', 'against', 'between',
-                                    'into', 'through', 'during', 'before', 'after', 'above', 'below',
-                                    'to', 'of', 'in', 'on', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-                                    'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing'])
-
-    def _load_citation_network(self):
-        """Load citation network if exists, otherwise create new"""
-        if os.path.exists(CONFIG['citation_network_file']):
+            logger.error(f"Failed to load spaCy model: {e}. Trying to download...")
             try:
-                with open(CONFIG['citation_network_file'], 'r') as f:
-                    self.citation_network = json.load(f)
-                logger.info(f"Loaded citation network with {len(self.citation_network['papers'])} papers")
-            except Exception as e:
-                logger.warning(f"Could not load citation network: {str(e)}, creating new one")
-                self._initialize_empty_citation_network()
-        else:
-            logger.info("No existing citation network found, creating new one")
-            self._initialize_empty_citation_network()
-
-    def _initialize_empty_citation_network(self):
-        """Initialize an empty citation network structure"""
-        self.citation_network = {
-            'papers': {},
-            'authors': {},
-            'categories': {},
-            'citations': {}
-        }
-
-    def _save_citation_network(self):
-        """Save citation network to disk"""
-        with open(CONFIG['citation_network_file'], 'w') as f:
-            json.dump(self.citation_network, f)
-
-    def _fetch_and_download_arxiv_paper(self, paper_id):
-        """Fetch metadata and download PDF for a single arXiv paper ID."""
-        filepath = os.path.join(self.papers_dir, f"{paper_id}.pdf")
-
-        # Check cache first
-        if paper_id in self.metadata_cache:
-            return self.metadata_cache[paper_id]
-
-        # Check if PDF exists locally
-        pdf_exists = os.path.exists(filepath)
-
-        # Check if paper ID exists in citation network (even if PDF is missing)
-        network_exists = paper_id in self.citation_network['papers']
-
-        # Attempt to fetch metadata from arXiv
-        try:
-            search = arxiv.Search(id_list=[paper_id])
-            result = next(search.results()) # Fetch the first (and only) result
-        except StopIteration:
-            logger.warning(f"Paper ID {paper_id} not found on arXiv.")
-            return None
-        except Exception as e:
-            logger.error(f"Error searching arXiv for {paper_id}: {e}")
-            return None
-
-        # Download PDF if it doesn't exist locally
-        if not pdf_exists:
-            logger.info(f"Downloading PDF for {paper_id}...")
-            try:
-                result.download_pdf(dirpath=self.papers_dir, filename=f"{paper_id}.pdf")
-                time.sleep(0.5) # Be nice to arXiv
-            except Exception as e:
-                logger.error(f"Failed to download PDF for {paper_id}: {e}")
-                # Continue to extract metadata even if download fails, but mark filepath as None
-                filepath = None # Indicate PDF is not available locally
-        else:
-             logger.debug(f"PDF for {paper_id} already exists locally.")
-
-
-        # Extract metadata
-        paper_metadata = {
-            'id': paper_id,
-            'title': result.title,
-            'authors': [author.name for author in result.authors],
-            'categories': result.categories,
-            'abstract': result.summary,
-            'published': str(result.published),
-            'updated': str(result.updated),
-            'doi': result.doi,
-            'filepath': filepath # Might be None if download failed
-        }
-
-        # Update citation network (even if download failed, metadata is useful)
-        self._update_citation_network(paper_id, paper_metadata)
-
-        # Cache metadata
-        self.metadata_cache[paper_id] = paper_metadata
-        return paper_metadata
-
-    def download_papers(self, query, max_results=CONFIG['max_papers_per_query']):
-        """Download papers from arXiv based on query using the helper method."""
-        logger.info(f"Downloading papers via arXiv query: '{query}'")
-
-        # We might need to fetch more results initially to ensure we get `max_results` unique ones
-        # after filtering duplicates or failed downloads.
-        search_limit = max_results * 2
-
-        search = arxiv.Search(
-            query=query,
-            max_results=search_limit,
-            sort_by=arxiv.SortCriterion.SubmittedDate
+                # Try to download the model if not available
+                spacy.cli.download("en_core_web_sm")
+                self.nlp = spacy.load("en_core_web_sm")
+                self.nlp.max_length = 1500000
+                logger.info("Downloaded and loaded spaCy model")
+            except Exception as e2:
+                logger.error(f"Could not download spaCy model: {e2}. Text preprocessing will be limited.")
+                self.nlp = None
+        
+        # Initialize the TF-IDF vectorizer for concept extraction
+        self.tfidf_vectorizer = TfidfVectorizer(
+            max_features=CONFIG.get('max_features', 7500),
+            ngram_range=(1, 2),  # Allow single words and bigrams
+            stop_words='english',
+            min_df=1
         )
-
-        metadata_list = []
-        processed_ids = set() # Keep track of IDs processed in this run
-
-        with tqdm(total=max_results, desc="Fetching arXiv papers") as pbar:
-            try:
-                for result in search.results():
-                    if len(metadata_list) >= max_results:
-                        break
-
-                    paper_id = result.entry_id.split('/')[-1]
-                    if paper_id in processed_ids:
-                        continue # Skip if already processed in this search iteration
-
-                    processed_ids.add(paper_id)
-
-                    # Use the helper method to fetch/download and get metadata
-                    paper_metadata = self._fetch_and_download_arxiv_paper(paper_id)
-
-                    if paper_metadata:
-                        metadata_list.append(paper_metadata)
-                        pbar.update(1)
-                    else:
-                        # Log if fetching metadata failed, but don't stop the loop
-                        logger.warning(f"Could not retrieve metadata for paper ID {paper_id} from query.")
-
-            except Exception as e:
-                 logger.error(f"An error occurred during arXiv search: {e}")
-
-        # Save citation network potentially updated by the helper method
-        self._save_citation_network()
-
-        logger.info(f"Finished arXiv query. Retrieved metadata for {len(metadata_list)} papers.")
-        return metadata_list
-
-
-    def download_papers_from_repo(self, repo_url="https://github.com/dair-ai/ML-Papers-of-the-Week",
-                                  clone_dir="ml_papers_repo", max_results=CONFIG['max_papers_per_query']):
-        """Download papers listed in the dair-ai/ML-Papers-of-the-Week repo."""
-        logger.info(f"Downloading papers from Git repo: {repo_url}")
-
-        # Define paths
-        repo_path = os.path.join(self.papers_dir, "..", clone_dir)  # Clone outside papers_dir
-        ml_papers_dir = os.path.join(repo_path, "papers")  # Papers inside the repo
-
-        # First, check for existing papers in both our papers directory and the ML papers repo
-        existing_papers = set()
         
-        # Check main papers directory
-        logger.info(f"Checking existing papers in {self.papers_dir}")
-        for filename in os.listdir(self.papers_dir):
-            if filename.endswith('.pdf'):
-                paper_id = filename.replace('.pdf', '')
-                existing_papers.add(paper_id)
+        # Get embedding dimension from config
+        self.embedding_dim = CONFIG.get('embedding_size', 768)
         
-        logger.info(f"Found {len(existing_papers)} existing papers in main papers directory")
-        
-        # Check for papers in citation network
-        network_papers = set(self.citation_network['papers'].keys()) if 'papers' in self.citation_network else set()
-        existing_papers.update(network_papers)
-        
-        logger.info(f"Total existing papers (including citation network): {len(existing_papers)}")
-
-        # Clone or pull the repo
+        # Initialize sentence transformer for text embeddings
         try:
-            if os.path.exists(repo_path):
-                logger.info(f"Updating existing repository at {repo_path}")
-                repo = git.Repo(repo_path)
-                origin = repo.remotes.origin
-                origin.pull()
+            model_name = CONFIG.get('sentence_transformer_model')
+            self.sentence_transformer = SentenceTransformer(model_name) if CONFIG.get('use_sentence_transformer') else None
+            if self.sentence_transformer:
+                logger.info(f"Loaded sentence transformer model: {model_name}")
             else:
-                logger.info(f"Cloning repository from {repo_url} to {repo_path}")
-                git.Repo.clone_from(repo_url, repo_path)
-        except git.GitCommandError as e:
-            logger.error(f"Git command failed: {e}")
-            return []
+                logger.info("Sentence transformer disabled in config")
         except Exception as e:
-            logger.error(f"Failed to clone or pull repository: {e}")
-            return []
-
-        # Also check if there are any PDFs in the repo itself (if it contains papers)
-        if os.path.exists(ml_papers_dir):
-            logger.info(f"Checking for papers in ML papers repo: {ml_papers_dir}")
-            for filename in os.listdir(ml_papers_dir):
-                if filename.endswith('.pdf'):
-                    paper_id = filename.replace('.pdf', '')
-                    existing_papers.add(paper_id)
-            logger.info(f"Found additional papers in ML papers repo. Total existing: {len(existing_papers)}")
-
-        # Find arXiv IDs in README.md and other markdown files
-        arxiv_ids = set()
-        readme_path = os.path.join(repo_path, "README.md")
-        try:
-            # Process README.md
-            self._extract_arxiv_ids_from_file(readme_path, arxiv_ids)
-            
-            # Process any other markdown files in the repo's research directory
-            research_dir = os.path.join(repo_path, "research")
-            if os.path.exists(research_dir):
-                logger.info(f"Checking for arXiv IDs in markdown files in {research_dir}")
-                for filename in os.listdir(research_dir):
-                    if filename.endswith('.md'):
-                        md_path = os.path.join(research_dir, filename)
-                        self._extract_arxiv_ids_from_file(md_path, arxiv_ids)
-                        
-            logger.info(f"Found {len(arxiv_ids)} potential arXiv IDs in the repository")
-        except Exception as e:
-            logger.error(f"Error processing markdown files: {e}")
-            if not arxiv_ids:
-                return []
+            logger.error(f"Failed to load sentence transformer: {e}")
+            self.sentence_transformer = None
         
-        if not arxiv_ids:
-            logger.warning("No arXiv IDs extracted from the repository.")
-            return []
+        # Multi-processing settings
+        self.max_workers = CONFIG.get('num_workers', 4)
+        
+        logger.info(f"Initialized PaperProcessor with embedding model {self.embedding_manager.embedding_model}")
 
-        # First, filter out papers we already have
-        new_arxiv_ids = []
-        for paper_id in arxiv_ids:
-            if paper_id not in existing_papers and paper_id not in self.metadata_cache:
-                new_arxiv_ids.append(paper_id)
-            else:
-                logger.debug(f"Skipping already processed paper: {paper_id}")
-        
-        logger.info(f"Found {len(new_arxiv_ids)} new papers (out of {len(arxiv_ids)} total)")
-        
-        # Fetch and download papers using the helper method
-        metadata_list = []
-        papers_to_process = list(new_arxiv_ids)[:max_results]  # Respect max_results limit
-        
-        with tqdm(total=len(papers_to_process), desc="Fetching repo papers") as pbar:
-            for paper_id in papers_to_process:
-                 # First check if we already have this paper in our cache
-                 if paper_id in self.metadata_cache:
-                     paper_metadata = self.metadata_cache[paper_id]
-                     metadata_list.append(paper_metadata)
-                     pbar.update(1)
-                     continue
-                     
-                 # Otherwise fetch from arXiv
-                 paper_metadata = self._fetch_and_download_arxiv_paper(paper_id)
-                 if paper_metadata:
-                     metadata_list.append(paper_metadata)
-                 else:
-                     logger.warning(f"Could not retrieve metadata for paper ID {paper_id} from repo.")
-                 pbar.update(1)
-
-        # Save citation network potentially updated by the helper method
-        self._save_citation_network()
-
-        logger.info(f"Finished repo processing. Retrieved metadata for {len(metadata_list)} papers.")
-        return metadata_list
-        
-    def _extract_arxiv_ids_from_file(self, file_path, id_set):
-        """Extract arXiv IDs from a markdown file and add them to the given set."""
-        if not os.path.exists(file_path):
-            logger.warning(f"File not found: {file_path}")
-            return
+    def _extract_text_from_pdf(self, filepath):
+        """Extract text from PDF file with robust error handling"""
+        if not os.path.exists(filepath):
+            logger.warning(f"PDF file does not exist: {filepath}")
+            return ""
             
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                
-                # Regex patterns for different arXiv URL formats
-                patterns = [
-                    r'arxiv\.org/(?:abs|pdf)/([\d\.]+v\d*|[\d\.]+|[a-zA-Z\-\.]+/[\d\.]+v\d*|[a-zA-Z\-\.]+/[\d\.]+)',  # Main pattern for URLs
-                    r'arxiv:([\d\.]+v\d*|[\d\.]+|[a-zA-Z\-\.]+/[\d\.]+v\d*|[a-zA-Z\-\.]+/[\d\.]+)'  # arxiv:XXXX.XXXXX format
-                ]
-                
-                for pattern in patterns:
-                    found_ids = re.findall(pattern, content)
-                    for arxiv_id in found_ids:
-                        # Clean up the ID - remove version numbers if present
-                        clean_id = re.sub(r'v\d+$', '', arxiv_id)
-                        id_set.add(clean_id)
-                        
-                logger.debug(f"Extracted {len(found_ids)} arXiv IDs from {file_path}")
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-
-    def _update_citation_network(self, paper_id, metadata):
-        """Update citation network with new paper"""
-        # Ensure metadata is not None and has essential keys
-        if not metadata or not metadata.get('title') or not metadata.get('id'):
-            logger.warning(f"Invalid or incomplete metadata for paper ID {paper_id}, skipping citation network update.")
-            return
-
-        # Use the correct paper_id from metadata dict
-        current_paper_id = metadata['id']
-
-        # Update paper details
-        self.citation_network['papers'][current_paper_id] = {
-            'title': metadata.get('title'),
-            'authors': metadata.get('authors', []),
-            'categories': metadata.get('categories', []),
-            'published': metadata.get('published', '')
-        }
-
-        # Update author index
-        for author in metadata.get('authors', []):
-            if author not in self.citation_network['authors']:
-                self.citation_network['authors'][author] = []
-            if current_paper_id not in self.citation_network['authors'][author]:
-                self.citation_network['authors'][author].append(current_paper_id)
-
-        # Update category index
-        for category in metadata.get('categories', []):
-            if category not in self.citation_network['categories']:
-                self.citation_network['categories'][category] = []
-            if current_paper_id not in self.citation_network['categories'][category]:
-                self.citation_network['categories'][category].append(current_paper_id)
-
-
-    def extract_text(self, filepath):
-        """Extract text from PDF file"""
-        # Ensure filepath is not None before trying to open
-        if filepath is None or not os.path.exists(filepath):
-             logger.warning(f"PDF filepath is missing or invalid: {filepath}. Cannot extract text.")
-             return ''
-        try:
-            # Dynamically import PyPDF2 only when needed
-            try:
-                import PyPDF2
-            except ImportError:
-                logger.error("PyPDF2 is not installed. Please install it (`pip install pypdf2`) to extract text from PDFs.")
-                return ''
-
+            text = ""
             with open(filepath, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
-                # Check if PDF is encrypted
-                if reader.is_encrypted:
-                    logger.warning(f"PDF {filepath} is encrypted and cannot be read.")
-                    return ''
-
-                text = ''.join(page.extract_text() or '' for page in reader.pages if page.extract_text()) # Ensure text exists before joining
-                # Basic check for meaningful content length
-                return text if len(text) > 100 else '' # Increased minimum length
-        except FileNotFoundError:
-             logger.error(f"PDF file not found at {filepath}.")
-             return ''
-        except PyPDF2.errors.PdfReadError as e:
-            logger.error(f"Failed to read PDF {filepath} (possibly corrupted): {e}")
-            return ''
+                num_pages = len(reader.pages)
+                
+                # Extract text from all pages
+                for page_num in range(num_pages):
+                    try:
+                        page = reader.pages[page_num]
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n\n"
+                    except Exception as e:
+                        logger.warning(f"Error extracting text from page {page_num}: {e}")
+            
+            # Clean the text
+            text = self._clean_text(text)
+            return text
         except Exception as e:
-            logger.error(f"Failed to extract text from {filepath}: {e}")
-            return ''
-
-    def preprocess(self, text):
-        """Enhanced text preprocessing with advanced NLP techniques for better neural network understanding"""
+            logger.error(f"Failed to extract text from PDF {filepath}: {e}")
+            return ""
+    
+    def _clean_text(self, text):
+        """Clean and normalize text from PDFs"""
+        if not text:
+            return ""
+            
+        # Replace excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove URLs
+        text = re.sub(r'http[s]?://\S+', '', text)
+        
+        # Remove special characters but keep meaningful punctuation
+        text = re.sub(r'[^\w\s.,;:?!-]', '', text)
+        
+        # Replace sequences of punctuation with single instances
+        text = re.sub(r'[.,;:?!-]+', lambda m: m.group(0)[0], text)
+        
+        return text.strip()
+    
+    def _extract_concepts(self, text, top_n=CONFIG['top_n_concepts']):
+        """Extract key concepts from text using improved NLP techniques"""
+        if not text:
+            return []
+            
+        # Tokenize text
+        tokens = nltk.word_tokenize(text.lower())
+        
+        # Remove stopwords and short tokens
+        tokens = [self.lemmatizer.lemmatize(token) for token in tokens 
+                 if token not in self.stopwords and len(token) > 2]
+        
+        # Count token frequencies
+        token_counts = Counter(tokens)
+        
+        # Extract most common tokens as concepts
+        concepts = [concept for concept, count in token_counts.most_common(top_n)]
+        
+        return concepts
+    
+    def generate_embedding(self, text):
+        """Generate embedding for text using advanced transformer models"""
+        # Delegate to embedding manager
+        return self.embedding_manager.get_embedding_for_text(text)
+    
+    def process_paper(self, paper_data):
+        """Process a single paper with advanced embedding generation
+        
+        Args:
+            paper_data (dict): Paper metadata with filepath
+            
+        Returns:
+            dict: Processed paper with extracted features
+        """
+        if not paper_data or 'filepath' not in paper_data:
+            logger.warning("Invalid paper data for processing")
+            return None
+            
         try:
-            # Advanced cleaning
-            # Remove URLs
-            text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-            # Remove email addresses
-            text = re.sub(r'\S*@\S*\s?', '', text)
-            # Remove citations like [1], [2,3], etc.
-            text = re.sub(r'\[\d+(?:,\s*\d+)*\]', '', text)
-            # Remove numbers but keep important ones in context (e.g., 'Figure 1' becomes 'Figure')
-            text = re.sub(r'(?<!\w)\d+(?!\w)', '', text)
-            # Replace non-alphanumeric with space
-            text = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
-            # Normalize whitespace
-            text = re.sub(r'\s+', ' ', text).strip()
-
-            # Tokenize with more advanced handling
-            tokens = word_tokenize(text)
-
-            # Enhanced stopword filtering with domain-specific terms
-            domain_stop_words = self.stop_words.union({
-                'fig', 'figure', 'eq', 'equation', 'table', 'section',
-                'algorithm', 'theorem', 'proof', 'lemma', 'corollary',
-                'appendix', 'acknowledgement', 'acknowledgments', 'bibliography',
-                'references', 'et', 'al', 'doi', 'preprint', 'arxiv', 'journal',
-                'conference', 'proceedings', 'ieee', 'acm', 'vol', 'volume',
-                'no', 'number', 'pp', 'pages', 'author', 'university'
-            })
-
-            # Filter tokens with enhanced criteria
-            filtered_tokens = [
-                t for t in tokens
-                if t not in domain_stop_words
-                and len(t) > 2  # Remove very short tokens
-                and len(t) < 25  # Remove very long tokens (likely parsing errors)
-            ]
-
-            # Try lemmatization with part-of-speech tagging for better results
-            try:
-                # Check if lemmatizer is available
-                if self.lemmatizer is not None:
-                    # Use WordNet lemmatizer with POS tagging for better accuracy
-                    lemmatized_tokens = []
-                    for token in filtered_tokens:
-                        # Default to noun for lemmatization
-                        lemmatized_tokens.append(self.lemmatizer.lemmatize(token, pos='n'))
-
-                    # Join tokens back into text
-                    processed_text = ' '.join(lemmatized_tokens)
-                else:
-                    # Fall back to filtered tokens without lemmatization
-                    processed_text = ' '.join(filtered_tokens)
-                    logger.info("Using basic tokens without lemmatization")
-
-                # Handle n-grams for technical terms (e.g., "machine learning" as a single concept)
-                # This helps the neural network recognize important multi-word concepts
-                bigrams = [' '.join(pair) for pair in zip(lemmatized_tokens[:-1], lemmatized_tokens[1:])]
-                trigrams = [' '.join(triple) for triple in zip(lemmatized_tokens[:-2], lemmatized_tokens[1:-1], lemmatized_tokens[2:])]
-
-                # Add important n-grams to the processed text
-                important_ngrams = self._extract_important_ngrams(bigrams + trigrams)
-                if important_ngrams:
-                    processed_text += ' ' + ' '.join(important_ngrams)
-
-                return processed_text
-
-            except Exception as e:
-                logger.warning(f"Advanced lemmatization failed: {e}. Using basic filtered tokens instead.")
-                return ' '.join(filtered_tokens)
-
+            # Extract text from PDF
+            paper_text = self._extract_text_from_pdf(paper_data['filepath'])
+            
+            if not paper_text:
+                logger.warning(f"Empty text extracted from {paper_data.get('id', 'unknown')}")
+                return None
+                
+            # Generate embedding for full text
+            embedding = self.generate_embedding(paper_text)
+            
+            # Extract concepts from text
+            concepts = self._extract_concepts(paper_text)
+            
+            # Combine all data
+            processed_paper = {
+                'id': paper_data.get('id'),
+                'title': paper_data.get('title', ''),
+                'embedding': embedding,
+                'concepts': concepts,
+                'metadata': {
+                    'authors': paper_data.get('authors', []),
+                    'categories': paper_data.get('categories', []),
+                    'published': paper_data.get('published', ''),
+                    'updated': paper_data.get('updated', ''),
+                    'entry_id': paper_data.get('entry_id', ''),
+                    'pdf_url': paper_data.get('pdf_url', '')
+                }
+            }
+            
+            # Add abstract if available
+            if 'abstract' in paper_data:
+                processed_paper['abstract'] = paper_data['abstract']
+            
+            return processed_paper
+            
         except Exception as e:
-            logger.error(f"Enhanced text preprocessing failed: {e}")
-            # Return a simplified version as fallback
-            return text.lower()
+            logger.error(f"Error processing paper {paper_data.get('id', 'unknown')}: {e}")
+            return None
+    
+    def process_papers_batch(self, papers_metadata):
+        """Process a batch of papers in parallel
+        
+        Args:
+            papers_metadata (list): List of paper metadata dictionaries
+            
+        Returns:
+            list: Processed papers with features
+        """
+        if not papers_metadata:
+            return []
+            
+        processed_papers = []
+        
+        # Process papers in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_paper = {executor.submit(self.process_paper, paper): paper for paper in papers_metadata}
+            
+            # Process results as they complete
+            for future in tqdm(as_completed(future_to_paper), total=len(papers_metadata), desc="Processing papers"):
+                paper = future_to_paper[future]
+                
+                try:
+                    processed_paper = future.result()
+                    if processed_paper:
+                        processed_papers.append(processed_paper)
+                except Exception as e:
+                    logger.error(f"Error in paper processing task for {paper.get('id', 'unknown')}: {e}")
+        
+        logger.info(f"Processed {len(processed_papers)} papers out of {len(papers_metadata)} submitted")
+        
+        # Print embedding cache stats
+        cache_stats = self.embedding_manager.get_cache_stats()
+        logger.info(f"Embedding cache stats: hit rate {cache_stats['hit_rate']:.1f}%, hits: {cache_stats['cache_hits']}, misses: {cache_stats['cache_misses']}")
+        
+        return processed_papers
+    
+    def download_papers(self, query, max_results=100):
+        """Download papers from ArXiv based on a query
+        
+        Args:
+            query (str): Search query for ArXiv
+            max_results (int): Maximum number of papers to download
+            
+        Returns:
+            list: List of paper metadata dictionaries
+        """
+        logger.info(f"Searching ArXiv for query: '{query}' (max_results={max_results})")
+        
+        try:
+            # Search ArXiv
+            search = arxiv.Search(
+                query=query,
+                max_results=max_results,
+                sort_by=arxiv.SortCriterion.Relevance
+            )
+            
+            results = list(search.results())
+            if not results:
+                logger.warning(f"No papers found on ArXiv for query: {query}")
+                return []
+                
+            logger.info(f"Found {len(results)} potential papers on ArXiv")
+            
+            # Download papers in parallel
+            papers_metadata = []
+            download_count = 0
+            
+            with ThreadPoolExecutor(max_workers=min(CONFIG.get('max_parallel_downloads', 8), len(results))) as executor:
+                # Submit download tasks
+                futures = []
+                for paper in results:
+                    futures.append(executor.submit(self._download_single_paper, paper))
+                
+                # Process results as they complete
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Downloading papers"):
+                    try:
+                        paper_meta = future.result()
+                        if paper_meta:
+                            papers_metadata.append(paper_meta)
+                            download_count += 1
+                    except Exception as e:
+                        logger.error(f"Error in paper download task: {e}")
+            
+            logger.info(f"Successfully downloaded {download_count} papers")
+            return papers_metadata
+            
+        except Exception as e:
+            logger.error(f"ArXiv search failed for query '{query}': {e}")
+            return []
+    
+    def _download_single_paper(self, paper):
+        """Download a single paper from ArXiv
+        
+        Args:
+            paper: ArXiv paper object
+            
+        Returns:
+            dict: Paper metadata or None on failure
+        """
+        try:
+            # Extract ID
+            paper_id_raw = paper.entry_id.split('/abs/')[-1].split('v')[0]
+            # Sanitize paper ID for filename
+            paper_id_safe = paper_id_raw.replace('/', '_')
+            pdf_filename = f"{paper_id_safe}.pdf"
+            filepath = os.path.join(self.papers_dir, pdf_filename)
+            
+            # Check if already exists
+            if not os.path.exists(filepath):
+                paper.download_pdf(dirpath=self.papers_dir, filename=pdf_filename)
+                time.sleep(0.5)  # Be polite to ArXiv API
+            
+            # Prepare metadata
+            meta = {
+                'id': paper_id_raw,
+                'filepath': filepath,
+                'title': paper.title,
+                'abstract': paper.summary,
+                'authors': [str(a) for a in paper.authors],
+                'published': paper.published.isoformat(),
+                'updated': paper.updated.isoformat(),
+                'categories': paper.categories,
+                'pdf_url': paper.pdf_url,
+                'entry_id': paper.entry_id
+            }
+            
+            return meta
+            
+        except Exception as e:
+            logger.warning(f"Failed to download paper {paper.entry_id}: {e}")
+            return None
+    
+    def get_embedding_cache_stats(self):
+        """Get embedding cache statistics"""
+        return self.embedding_manager.get_cache_stats()
 
-    def _extract_important_ngrams(self, ngrams, max_ngrams=100):
-        """Extract important n-grams based on frequency and domain relevance"""
-        # Count n-gram frequencies
-        ngram_counts = Counter(ngrams)
+    def _save_cache(self, cache_data, cache_path):
+        try:
+             temp_path = cache_path + ".tmp"
+             with open(temp_path, 'w') as f:
+                  json.dump(cache_data, f, indent=2)
+             os.replace(temp_path, cache_path)
+             logger.debug(f"Saved cache to {cache_path}")
+        except Exception as e:
+             logger.error(f"Error saving cache to {cache_path}: {e}")
 
-        # Filter out rare n-grams (likely noise)
-        min_count = 2  # n-gram must appear at least twice
-        filtered_ngrams = {ng: count for ng, count in ngram_counts.items() if count >= min_count}
+    def _load_cache(self, cache_path):
+        """Load cache data from a JSON file."""
+        if not os.path.exists(cache_path):
+            logger.warning(f"Cache file not found: {cache_path}. Returning empty cache.")
+            return {} # Return empty dict if file doesn't exist
+        try:
+            with open(cache_path, 'r') as f:
+                cache_data = json.load(f)
+            logger.debug(f"Loaded cache from {cache_path}")
+            return cache_data
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from cache file {cache_path}: {e}. Returning empty cache.")
+            return {}
+        except Exception as e:
+            logger.error(f"Error loading cache from {cache_path}: {e}. Returning empty cache.")
+            return {}
 
-        # Sort by frequency
-        sorted_ngrams = sorted(filtered_ngrams.items(), key=lambda x: x[1], reverse=True)
+    # ADD new preprocess_text using spaCy
+    def preprocess_text(self, text):
+        """Preprocess text using spaCy for lemmatization and stopword removal."""
+        if not text or self.nlp is None:
+            # Log warning if spaCy isn't available but we expected it
+            if not text: logger.debug("Cannot preprocess empty text.")
+            if self.nlp is None: logger.warning("spaCy model not available for preprocessing.")
+            return [] # Return empty list if no text or no spaCy model
+        try:
+            # Process text with spaCy - consider increasing max_length if needed for long papers
+            # self.nlp.max_length = len(text) + 100 # Uncomment if hitting length limits
+            doc = self.nlp(text.lower()) # Process in lowercase
 
-        # Take top n-grams
-        return [ng for ng, _ in sorted_ngrams[:max_ngrams]]
+            # Lemmatize, remove stopwords, punctuation, and short tokens
+            processed_tokens = [
+                token.lemma_
+                for token in doc
+                if not token.is_stop
+                and not token.is_punct
+                and not token.is_space
+                and len(token.lemma_) > CONFIG.get('min_token_length', 2) # Configurable min length
+            ]
+            # Basic check if processing yielded any result
+            if not processed_tokens:
+                 logger.warning("Preprocessing resulted in empty token list.")
+            return processed_tokens
+        except ValueError as e:
+             # Handle potential spaCy length limit errors
+             if "is greater than the model's maximum attribute" in str(e):
+                  logger.error(f"Text length ({len(text)}) exceeds spaCy model's max length. Truncating or increase max_length. Error: {e}")
+                  # Option: Truncate text and retry?
+                  # Option: Increase self.nlp.max_length (might need more RAM)?
+                  # For now, return empty list to signal failure.
+                  return []
+             else:
+                 logger.error(f"SpaCy preprocessing failed with ValueError: {e}")
+                 return [] # Fallback
+        except Exception as e:
+             logger.error(f"SpaCy preprocessing failed: {e}")
+             # Fallback to simple split?
+             return text.lower().split() # Very basic fallback
 
-    def extract_concepts(self, text, top_n=100):
-        """Extract key concepts from text using advanced NLP techniques optimized for neural network understanding"""
-        # Apply enhanced preprocessing
-        processed_text = self.preprocess(text)
+    def extract_concepts(self, processed_tokens, top_n=CONFIG.get('top_n_concepts', 50)):
+        """Extract key concepts using TF-IDF on preprocessed tokens."""
+        # Remove the internal call to self.preprocess(text)
+        # Remove the logic handling short text or using original text
 
-        # If text is too short, try to use the original text
-        if len(processed_text.split()) < 50 and len(text) > 1000:
-            logger.warning("Processed text too short, using original text with basic cleaning")
-            processed_text = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
-            processed_text = re.sub(r'\s+', ' ', processed_text).strip()
+        if not processed_tokens:
+            logger.warning("Cannot extract concepts from empty token list.")
+            return []
 
         try:
             # Use a combination of TF-IDF and domain-specific keyword extraction
             # 1. TF-IDF for statistical importance
-            vectorizer = TfidfVectorizer(
-                max_features=top_n * 2,  # Get more features initially
-                ngram_range=(1, 3),      # Include unigrams, bigrams, and trigrams
-                min_df=2,                # Term must appear in at least 2 documents
-                max_df=0.95              # Ignore terms that appear in >95% of documents
-            )
+            # Join tokens back into a single string for TF-IDF
+            text_for_tfidf = ' '.join(processed_tokens)
+            if not text_for_tfidf.strip(): # Check if joined text is empty
+                 return []
+            
+            # Fit TF-IDF on the single processed document
+            # Consider if fitting on a larger corpus is needed for better IDF scores
+            tfidf_matrix = self.tfidf_vectorizer.fit_transform([text_for_tfidf])
+            feature_names = self.tfidf_vectorizer.get_feature_names_out()
+            scores = tfidf_matrix.toarray().flatten()
+            term_scores = list(zip(feature_names, scores))
+            
+            # Remove sorting/filtering logic previously done on paragraphs if no longer needed
+            # Keep keyword weighting for domain relevance?
 
-            # Create a small corpus by splitting the text into paragraphs
-            paragraphs = re.split(r'\n\s*\n', text)  # Split on double newlines
-            paragraphs = [p for p in paragraphs if len(p.strip()) > 100]  # Filter out short paragraphs
-
-            # If we don't have enough paragraphs, create artificial ones
-            if len(paragraphs) < 5:
-                # Split into sentences and group them into 5-10 sentence chunks
-                sentences = re.split(r'[.!?]\s+', text)
-                sentences = [s for s in sentences if len(s.strip()) > 20]  # Filter out short sentences
-                chunk_size = max(1, len(sentences) // 10)  # Aim for about 10 chunks
-                paragraphs = [' '.join(sentences[i:i+chunk_size]) for i in range(0, len(sentences), chunk_size)]
-
-            # Process each paragraph
-            processed_paragraphs = [self.preprocess(p) for p in paragraphs]
-            processed_paragraphs = [p for p in processed_paragraphs if p]  # Remove empty paragraphs
-
-            if not processed_paragraphs:
-                # Fallback if we couldn't create paragraphs
-                processed_paragraphs = [processed_text]
-
-            # Apply TF-IDF
-            tfidf_matrix = vectorizer.fit_transform(processed_paragraphs)
-            feature_names = vectorizer.get_feature_names_out()
-
-            # Calculate average TF-IDF scores across paragraphs
-            avg_scores = np.mean(tfidf_matrix.toarray(), axis=0)
-            tfidf_scores = list(zip(feature_names, avg_scores))
-
-            # 2. Add domain-specific keyword weighting
+            # 2. Add domain-specific keyword weighting (Optional but potentially useful)
             weighted_scores = []
-            domain_keywords = {
-                'algorithm', 'model', 'method', 'framework', 'system', 'approach',
-                'neural', 'network', 'deep', 'learning', 'reinforcement', 'supervised',
-                'unsupervised', 'classification', 'regression', 'clustering', 'optimization',
-                'transformer', 'attention', 'embedding', 'representation', 'feature',
-                'training', 'inference', 'evaluation', 'performance', 'accuracy', 'precision',
-                'recall', 'f1', 'loss', 'gradient', 'backpropagation', 'convergence'
-            }
+            domain_keywords = CONFIG.get('domain_keywords', {
+                # Default keywords if not in config
+                'algorithm', 'model', 'method', 'framework', 'neural', 'network',
+                'deep', 'learning', 'transformer', 'attention', 'embedding', 
+                'training', 'inference', 'evaluation', 'loss', 'gradient' 
+            })
+            keyword_boost = CONFIG.get('keyword_boost', 1.5)
+            ngram_boost = CONFIG.get('ngram_boost', 1.2)
 
-            for term, score in tfidf_scores:
-                # Boost terms that are domain-specific keywords
-                if any(kw in term for kw in domain_keywords):
-                    score *= 1.5  # 50% boost for domain terms
-
-                # Boost multi-word terms (likely more specific concepts)
+            for term, score in term_scores:
+                boost = 1.0
+                # Boost terms that ARE domain-specific keywords
+                if term in domain_keywords:
+                    boost *= keyword_boost
+                # Boost multi-word terms (TF-IDF ngrams handle this)
                 if ' ' in term:
-                    score *= 1.2  # 20% boost for multi-word terms
-
-                weighted_scores.append((term, score))
+                    boost *= ngram_boost
+                weighted_scores.append((term, score * boost))
 
             # Sort by weighted score
             sorted_terms = sorted(weighted_scores, key=lambda x: x[1], reverse=True)
 
-            # Filter out terms with zero or very low scores
-            important_terms = [term for term, score in sorted_terms if score > 0.01]
+            # Filter out terms with very low scores
+            min_score_threshold = CONFIG.get('min_concept_score', 0.01)
+            important_terms = [term for term, score in sorted_terms if score > min_score_threshold]
 
             # Return top N terms
             return important_terms[:top_n]
 
         except Exception as e:
-            logger.error(f"Advanced concept extraction failed: {e}")
-            # Fallback to simple word frequency with n-grams
+            logger.error(f"TF-IDF concept extraction failed: {e}")
+            # Fallback: Use simple frequency count on tokens
             try:
-                words = processed_text.split()
-                # Count word frequencies
-                word_counts = Counter(words)
-                # Get most common words
-                common_words = [word for word, _ in word_counts.most_common(top_n)]
-                return common_words
+                counts = Counter(processed_tokens)
+                return [term for term, _ in counts.most_common(top_n)]
             except Exception as e2:
-                logger.error(f"Fallback concept extraction also failed: {e2}")
-                return []
-            word_freq = Counter(words)
-            return [word for word, _ in word_freq.most_common(top_n)]
+                 logger.error(f"Concept extraction fallback failed: {e2}")
+                 return []
 
-    def generate_paper_embedding(self, title, abstract):
-        """Generate paper embedding using Sentence Transformer or fallback TF-IDF"""
-        # Combine title and abstract for better context
-        text = f"{title}. {abstract}" # Added a separator
+    def generate_embedding(self, text):
+        """Generate embedding using Sentence Transformer.
+
+        Args:
+            text (str): The text (e.g., title + abstract) to embed.
+
+        Returns:
+            np.ndarray: The embedding vector (float32), or a zero vector on failure.
+        """
+        if self.sentence_transformer is None or not text:
+            if self.sentence_transformer is None:
+                 logger.warning("Sentence transformer not available. Cannot generate embedding.")
+            if not text:
+                 logger.debug("Cannot generate embedding for empty text.")
+            # Return zero vector of the expected dimension
+            return np.zeros(self.embedding_dim, dtype=np.float32)
         
-        # Use Sentence Transformer if available and configured
-        if self.sentence_transformer is not None and CONFIG.get('use_sentence_transformer', False):
-            try:
-                # Encode text - ensure output is numpy array
-                embedding = self.sentence_transformer.encode(text, convert_to_numpy=True)
-                
-                # Ensure embedding has the correct size (should be handled by model, but double check)
-                target_size = CONFIG['embedding_size']
-                if embedding.shape[0] != target_size:
-                    logger.warning(f"Sentence transformer embedding size mismatch: expected {target_size}, got {embedding.shape[0]}. Resizing.")
-                    # Pad or truncate
-                    if embedding.shape[0] > target_size:
-                        embedding = embedding[:target_size]
-                    else:
-                        embedding = np.pad(embedding, (0, target_size - embedding.shape[0]), 'constant')
-                
-                # Return as a standard float32 numpy array
-                return embedding.astype(np.float32)
-                
-            except Exception as e:
-                logger.error(f"Sentence Transformer encoding failed: {e}. Falling back to TF-IDF.")
-
-        # Fallback to TF-IDF if Sentence Transformer fails or is disabled
-        logger.warning("Falling back to basic TF-IDF for embedding generation.")
         try:
-            processed_text = self.preprocess(text)
-            if not processed_text.strip():
-                 logger.warning("No text content for TF-IDF embedding, returning zero vector.")
-                 return np.zeros(CONFIG['embedding_size'], dtype=np.float32)
-                 
-            # Use the pre-initialized TF-IDF vectorizer
-            # Need to fit if not already fit (e.g., first run)
-            if not hasattr(self.tfidf_vectorizer, 'vocabulary_') or not self.tfidf_vectorizer.vocabulary_:
-                 logger.info("Fitting TF-IDF vectorizer for fallback embedding.")
-                 self.tfidf_vectorizer.fit([processed_text]) # Fit on this single document if needed
-            
-            tfidf_vector = self.tfidf_vectorizer.transform([processed_text]).toarray().flatten()
-            
-            # Ensure the embedding has the correct size
-            target_size = CONFIG['embedding_size']
-            if len(tfidf_vector) > target_size:
-                embedding = tfidf_vector[:target_size]
-            elif len(tfidf_vector) < target_size:
-                embedding = np.pad(tfidf_vector, (0, target_size - len(tfidf_vector)), 'constant')
+            # Encode text - SBERT models generally prefer single strings or list of strings
+            # Pass as a list to handle potential batching internally, then flatten
+            embedding = self.sentence_transformer.encode([text], convert_to_numpy=True)
+            embedding = embedding.flatten() # Get the 1D array
+
+            # Ensure correct dimension (model should handle, but double-check)
+            if embedding.shape[0] != self.embedding_dim:
+                logger.warning(f"Embedding dim mismatch: {embedding.shape[0]} vs {self.embedding_dim}. Resizing.")
+                # Pad or truncate
+                if embedding.shape[0] > self.embedding_dim:
+                    embedding = embedding[:self.embedding_dim]
             else:
-                embedding = tfidf_vector
-                
+                    embedding = np.pad(embedding, (0, self.embedding_dim - embedding.shape[0]), 'constant')
+
             return embedding.astype(np.float32)
-            
         except Exception as e:
-            logger.error(f"TF-IDF fallback embedding failed: {e}. Returning zero vector.")
-            return np.zeros(CONFIG['embedding_size'], dtype=np.float32)
+            logger.error(f"Sentence Transformer encoding failed for text snippet starting with '{text[:50]}...': {e}")
+            return np.zeros(self.embedding_dim, dtype=np.float32) # Return zero vector on failure
+
+    # Rename original generate_paper_embedding to avoid confusion, or remove if unused
+    # def generate_paper_embedding(self, title, abstract): ... 
 
     def _extract_important_sentences(self, text, num_sentences=10):
         """Extract the most important sentences from text based on keyword density"""
         try:
             # Split text into sentences
-            sentences = re.split(r'[.!?]\s+', text)
+            # Use a more robust sentence splitter if needed
+            sentences = re.split(r'(?:[.!?]+\s+)|(?:\n\s*\n)', text) # Split on punctuation+space OR blank lines
             sentences = [s.strip() for s in sentences if len(s.strip()) > 20]  # Filter short sentences
-
+            
             if not sentences:
                 return []
 
-            # Extract key terms from the entire text
-            key_terms = set(self.extract_concepts(text, top_n=30))
+            # Extract key terms from the entire text using the updated extract_concepts
+            # Requires preprocessed tokens first
+            processed_tokens = self.preprocess_text(text)
+            if not processed_tokens:
+                return sentences[:num_sentences] # Fallback: return first few sentences
+               
+            key_terms = set(self.extract_concepts(processed_tokens, top_n=30))
+            if not key_terms:
+                return sentences[:num_sentences] # Fallback if no key terms
 
             # Score sentences based on presence of key terms
             sentence_scores = []
             for sentence in sentences:
-                # Count key terms in the sentence
+                # Simple check for term presence
                 term_count = sum(1 for term in key_terms if term.lower() in sentence.lower())
-                # Normalize by sentence length to avoid bias toward longer sentences
+                # Normalize by sentence length (using token count might be better)
                 score = term_count / max(1, len(sentence.split()))
                 sentence_scores.append((sentence, score))
 
@@ -732,120 +571,138 @@ class PaperProcessor:
 
         except Exception as e:
             logger.warning(f"Error extracting important sentences: {e}")
-            return []
+            # Fallback: return first few sentences
+            return sentences[:num_sentences] if 'sentences' in locals() else []
 
-    def find_related_papers(self, paper_id, top_n=10):
-        """Find papers related to given paper_id using citation network and embeddings"""
-        related = []
-
-        # Add papers that cite this paper
-        if paper_id in self.citation_network['cited_by']:
-            related.extend(self.citation_network['cited_by'][paper_id])
-
-        # Add papers cited by this paper
-        if paper_id in self.citation_network['citations']:
-            related.extend(self.citation_network['citations'][paper_id])
-
-        # Add papers by same authors
-        if paper_id in self.citation_network['papers']:
-            for author in self.citation_network['papers'][paper_id]['authors']:
-                related.extend(self.citation_network['authors'][author])
-
-        # Add papers in same categories
-        if paper_id in self.citation_network['papers']:
-            for category in self.citation_network['papers'][paper_id]['categories']:
-                related.extend(self.citation_network['categories'][category])
-
-        # Remove duplicates and the paper itself
-        related = list(set(related) - {paper_id})
-
-        return related[:top_n]
-
-    def process_papers_batch(self, papers, extract_concepts=True):
-        """Process a batch of papers in parallel"""
+    def process_papers_batch(self, papers_metadata):
+        """Process a batch of papers: extract text, concepts, embeddings."""
         results = []
+        if not papers_metadata:
+            return results
 
-        with ThreadPoolExecutor(max_workers=CONFIG['num_workers']) as executor:
-            futures = []
-            for paper in papers:
-                future = executor.submit(self._process_single_paper, paper, extract_concepts)
-                futures.append(future)
+        logger.info(f"Processing batch of {len(papers_metadata)} papers...")
 
-            for future in tqdm(futures, desc="Processing papers"):
-                result = future.result()
-                if result:
-                    results.append(result)
+        # --- Step 1: Extract Text (Parallel I/O) --- 
+        texts_to_process = {} # Use dict {paper_id: text}
+        with ThreadPoolExecutor(max_workers=CONFIG.get('max_pdf_workers', 4)) as executor:
+             futures = {}
+             for paper_meta in papers_metadata:
+                  filepath = paper_meta.get('filepath')
+                  paper_id = paper_meta.get('id')
+                  if filepath and paper_id:
+                       # Submit text extraction task
+                       futures[executor.submit(self._extract_text_from_pdf, filepath)] = paper_id
+                  else:
+                       logger.warning(f"Skipping paper {paper_id or 'Unknown ID'}: missing filepath.")
 
+             for future in tqdm(futures, desc="Extracting PDF text", total=len(futures)):
+                  paper_id = futures[future]
+                  try:
+                       text = future.result()
+                       if text:
+                            texts_to_process[paper_id] = text
+                       else:
+                            # Log warning but don't necessarily skip the paper yet
+                            logger.warning(f"Text extraction failed or yielded no content for {paper_id}. Concepts/Embeddings may be based on abstract only.")
+                  except Exception as e:
+                       logger.error(f"Error getting text extraction result for {paper_id}: {e}")
+
+        if not texts_to_process:
+             logger.warning("No text could be extracted from any paper in the batch. Attempting abstract-only processing.")
+             # Allow proceeding using abstracts if text extraction fails
+
+        # --- Step 2: Preprocess Text & Extract Concepts (Sequential for now) --- 
+        concepts_map = {}
+        processed_tokens_map = {}
+        logger.info("Preprocessing text and extracting concepts...")
+        
+        # Map paper_id to original metadata for easy access
+        meta_map = {p['id']: p for p in papers_metadata}
+
+        for paper_id, meta in tqdm(meta_map.items(), desc="Preprocessing/Concepts"):
+             # Use extracted text if available, otherwise fallback to abstract
+             text_to_process = texts_to_process.get(paper_id, meta.get('abstract'))
+             
+             if not text_to_process:
+                  logger.warning(f"No text or abstract available for {paper_id}. Skipping concept extraction.")
+                  continue # Skip if no text source
+
+             processed_tokens = self.preprocess_text(text_to_process)
+             if processed_tokens:
+                  processed_tokens_map[paper_id] = processed_tokens
+                  concepts = self.extract_concepts(processed_tokens)
+                  concepts_map[paper_id] = concepts
+             else:
+                  logger.warning(f"Preprocessing failed for {paper_id}")
+                  # Skip concept extraction if preprocessing fails
+
+        # --- Step 3: Generate Embeddings (Batch GPU-bound) --- 
+        embeddings_map = {}
+        if self.sentence_transformer:
+            logger.info("Generating embeddings...")
+            ids_for_embedding = []
+            texts_for_embedding = []
+            
+            for paper_id, meta in meta_map.items():
+                 # Use Title + Abstract for embedding consistency
+                 text_to_embed = f"{meta.get('title', '')}. {meta.get('abstract', '')}"
+                 if text_to_embed.strip() and len(text_to_embed.split()) > 5:
+                      ids_for_embedding.append(paper_id)
+                      texts_for_embedding.append(text_to_embed)
+            else:
+                      logger.warning(f"Skipping embedding for {paper_id}: Title/Abstract too short or missing.")
+            
+            if texts_for_embedding:
+                try:
+                    embeddings = self.sentence_transformer.encode(
+                         texts_for_embedding, 
+                         batch_size=CONFIG.get('embedding_batch_size', 32), 
+                         show_progress_bar=True, 
+                         convert_to_numpy=True
+                    )
+                    
+                    embeddings = embeddings.astype(np.float32)
+                    processed_embeddings = []
+                    for emb in embeddings:
+                         if emb.shape[0] != self.embedding_dim:
+                              # Resize logic (as before)
+                              if emb.shape[0] > self.embedding_dim: emb = emb[:self.embedding_dim]
+                              else: emb = np.pad(emb, (0, self.embedding_dim - emb.shape[0]), 'constant')
+                         processed_embeddings.append(emb)
+                    
+                    embeddings_map = dict(zip(ids_for_embedding, processed_embeddings))
+                    logger.info(f"Generated {len(embeddings_map)} embeddings.")
+                except Exception as e:
+                     logger.error(f"Batch embedding generation failed: {e}")
+
+        # --- Step 4: Assemble Results --- 
+        logger.info("Assembling processed paper data...")
+        for paper_meta in papers_metadata:
+            paper_id = paper_meta.get('id')
+            if not paper_id: continue # Skip if metadata has no ID
+            
+            # Include paper even if some steps failed, but mark data as potentially incomplete
+            embedding = embeddings_map.get(paper_id)
+            embedding_list = embedding.tolist() if embedding is not None else None
+            extracted_text = texts_to_process.get(paper_id)
+            
+            processed_paper = {
+                'id': paper_id,
+                'metadata': paper_meta, 
+                'concepts': concepts_map.get(paper_id, []), # Use concepts if available
+                'embedding': embedding_list, 
+                'has_full_text': extracted_text is not None,
+                'processed_timestamp': time.time()
+            }
+            results.append(processed_paper)
+
+        logger.info(f"Finished processing batch. Produced {len(results)} processed paper objects.")
         return results
 
-    def _process_single_paper(self, paper, extract_concepts):
-        """Process a single paper with enhanced data preparation for optimal neural network understanding"""
-        paper_id = paper.get('id') # Use .get() to avoid KeyError if 'id' is missing
-        if not paper_id:
-            logger.warning("Paper ID missing, skipping processing.")
-            return None
-
-        title = paper.get('title')
-        if not title:
-            logger.warning(f"Paper with ID {paper_id} is missing a title, skipping processing.")
-            return None
-
-        # Extract full text from PDF
-        full_text = self.extract_text(paper.get('filepath', ''))
-        if not full_text:
-            logger.warning(f"Could not extract text from {paper.get('filepath', '')} for paper {paper_id}")
-            # We can still proceed with title and abstract
-            full_text = None
-
-        # Extract concepts with advanced NLP techniques if needed
-        concepts = []
-        if extract_concepts:
-            # Use full text if available, otherwise use title and abstract
-            if full_text:
-                concepts = self.extract_concepts(full_text)
-            else:
-                concepts = self.extract_concepts(f"{title} {paper.get('abstract', '')}")
-
-        # Generate enhanced semantic embedding using all available information
-        embedding = self.generate_paper_embedding(
-            title=title,
-            abstract=paper.get('abstract', '')
-        )
-
-        # Create a rich paper representation with metadata for the neural network
-        processed_paper = {
-            'id': paper_id,
-            'metadata': paper,
-            'concepts': concepts,
-            'embedding': embedding.tolist(),
-            'has_full_text': full_text is not None,
-            'concept_count': len(concepts),
-            'processing_timestamp': time.time()
-        }
-
-        # Add additional metadata for better neural network understanding
-        if 'categories' in paper:
-            processed_paper['category_vector'] = self._create_category_vector(paper['categories'])
-
-        if 'authors' in paper:
-            processed_paper['author_count'] = len(paper['authors'])
-
-        return processed_paper
-
-    def _create_category_vector(self, categories):
-        """Create a one-hot encoding of paper categories for better classification"""
-        # Define common arXiv categories
-        common_categories = [
-            'cs.AI', 'cs.LG', 'cs.CL', 'cs.CV', 'cs.NE', 'cs.RO', 'cs.IR',
-            'stat.ML', 'math.OC', 'physics', 'q-bio', 'q-fin', 'econ'
-        ]
-
-        # Create one-hot encoding
-        category_vector = [0] * len(common_categories)
-
-        # Fill in the vector
-        for i, category in enumerate(common_categories):
-            if any(cat.startswith(category) for cat in categories):
-                category_vector[i] = 1
-
-        return category_vector
+    # Remove _process_single_paper if it exists
+    # def _process_single_paper(self, paper, extract_concepts):
+    #     ...
+        
+    # Remove _create_category_vector if it exists
+    # def _create_category_vector(self, categories):
+    #    ...
